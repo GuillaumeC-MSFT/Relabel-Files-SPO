@@ -56,7 +56,7 @@ Main menu option 3, *Enable SharePoint Online metered label writing*, performs t
 
 The preferred billing route is Azure CLI. After the utility collects and validates the resource group, billing-resource name, subscription ID, and application client ID, it runs Microsoft's documented command with those values:
 
-An exception applies when Microsoft.GraphServices returns the `OpenTelemetry` `TryCreateLogger` type-load failure. That is a provider implementation error, not a delay that retrying from another PowerShell process or Cloud Shell can repair. The utility retains the pending link and full error in its log, but suppresses automatic retries of that exact signature until the provider recovers or Azure support resolves it.
+An exception applies when Microsoft.GraphServices returns the `OpenTelemetry` `TryCreateLogger` type-load failure, including from ARM template validation. That is a provider implementation error, not a subscription, tenant, resource-group, or authorization problem, and retrying from another PowerShell process or Cloud Shell cannot repair it. The utility does not issue a mutating create after that failed validation. It retains the pending link and full error in its log, but suppresses automatic retries of that exact signature until the provider recovers or Azure support resolves it.
 
 ```powershell
 az graph-services account create --resource-group <resource-group> `
@@ -68,12 +68,12 @@ Before that call, the utility installs or upgrades the `graphservices` extension
 
 ### Billing preflight and verification
 
-Immediately before it runs `az graph-services account create`, the utility performs a **non-mutating preflight**. It stops before creation, and does not save a retry, when it finds any of these conditions:
+Immediately before it runs `az graph-services account create`, the utility performs a **non-mutating preflight**. It stops before creation, and does not save a retry, when it finds any of these user-fixable conditions:
 
 - The application service principal is definitely missing. The utility offers to grant administrator consent first and verifies that condition again afterwards.
 - The active Azure cloud is not the global `AzureCloud` environment, the subscription is not `Enabled`, or the subscription tenant differs from the Entra application tenant.
 - The selected resource group cannot be read, or `Microsoft.GraphServices` does not finish registering.
-- Azure Resource Manager rejects `az deployment group validate` for the exact `Microsoft.GraphServices/accounts` template that would be created. This is a validation-only call: it creates neither a billing resource nor a deployment.
+- Azure Resource Manager rejects `az deployment group validate` for the exact `Microsoft.GraphServices/accounts` template that would be created. This is a validation-only call: it creates neither a billing resource nor a deployment. The known `OpenTelemetry` provider implementation failure is classified separately and retained without automatic retries.
 
 The template validation exercises the current operator's Azure authorization, including the Contributor-level deployment access Microsoft requires, and lets the Graph Services provider validate the requested application association. It cannot prove that Microsoft's create backend is healthy or that Microsoft has approved access to the protected `assignSensitivityLabel` API. After creation, the utility follows Microsoft's documented verification sequence: `az resource list` confirms the resource state and `az resource show` confirms that `properties.appId` is the intended application ID.
 
@@ -403,7 +403,7 @@ Each run creates timestamped `.log` and `.csv` files. The CSV records every proc
 
 For the file-path source, the utility uses `Get-FileStatus` per file and calls `Set-FileLabel -PreserveFileDetails` only after apply mode and explicit confirmation. For SharePoint Online it reads labels with `Get-PnPFileSensitivityLabel`; Apply calls `Add-PnPFileSensitivityLabel`, which submits the metered `assignSensitivityLabel` request. Note the near-identical `Get-PnPFileSensitivityLabelInfo`: despite the more descriptive name it is a SharePoint tenant-admin CSOM call that fails with `Attempted to perform an unauthorized operation` for anyone who is not a SharePoint Administrator, so this utility deliberately does not use it. Failures are collected and reported instead of terminating the whole run. Operator menus allow retry, changed input, skip, main menu, or clean exit. Every session it opens, to Security &amp; Compliance PowerShell or to SharePoint, is closed on exit.
 
-At startup the utility records its version, the host, and the version of every module it can use into the run log, and warns when one is older than expected.
+At startup the utility records its version, the host, and the version of every module it can use into the run log, and warns when one is older than expected. A billing attempt additionally records the Azure CLI executable and version, `graphservices` extension version when installed, active cloud, subscription state and tenant, application and application tenant, resource group and location, provider registration state, advertised `Microsoft.GraphServices/accounts` API versions, validation deployment name, requested API version, nested ARM error codes, and tracking or correlation IDs. These diagnostics are log-only so the console stays readable. They contain no password, token, client secret, certificate material, or signed-in account name.
 
 PowerShell execution policy may block local scripts. Follow the customer's approved policy; do not weaken organization-wide policy solely to run this utility.
 

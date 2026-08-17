@@ -71,6 +71,7 @@ $script:ConnectedAppOnly = $false
 $script:LastBillingCorrelationIds = @()
 $script:LastBillingWasServiceFault = $false
 $script:LastBillingWasProviderFault = $false
+$script:LastBillingWasClientFault = $false
 $script:LastBillingFailureSignature = ''
 $script:LastBillingPreflightFailed = $false
 $script:LastBillingResourceStatus = $null
@@ -261,7 +262,7 @@ function Test-AzureProviderImplementationFailure {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Message)
 
-    return ($Message -match '(?is)TryCreateLogger.*cannot reduce access|OpenTelemetry\.Logs\.LoggerProviderSdk.*cannot reduce access')
+    return ($Message -match '(?is)(TryCreateLogger|OpenTelemetry(?:\.Logs\.)?LoggerProviderSdk).*cannot\W*reduce\W*access')
 }
 
 function Get-FailureSignature {
@@ -270,9 +271,41 @@ function Get-FailureSignature {
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
 
     $text = [regex]::Replace($Message, '\\u(?<code>[0-9a-fA-F]{4})', { param($match) [string][char][Convert]::ToInt32($match.Groups['code'].Value, 16) })
+    if (Test-AzureProviderImplementationFailure -Message $text) {
+        return 'microsoftgraphservicesopentelemetrytrycreateloggercannotreduceaccess'
+    }
     $text = [regex]::Replace($text, '(?i)(correlationid|request-id|client-request-id|date)\s*:\s*\S*', '')
     $text = [regex]::Replace($text, '(?i)[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}', '')
     return ([regex]::Replace($text, '[^a-zA-Z]', '')).ToLowerInvariant()
+}
+
+function Get-AzureFailureDiagnostic {
+    <# .SYNOPSIS Extracts Azure error codes and support identifiers without retaining credentials or response bodies. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Message)
+
+    $codes = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in [regex]::Matches($Message, '(?i)"code"\s*:\s*"(?<value>[^"]+)"')) {
+        $codes.Add($entry.Groups['value'].Value)
+    }
+
+    $identifiers = [System.Collections.Generic.List[string]]::new()
+    $identifierPattern = '(?i)(?<kind>tracking\s+id|correlation\s*id|request-id|client-request-id)\s*(?:is|[:=])\s*[''"]?(?<value>[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})'
+    foreach ($entry in [regex]::Matches($Message, $identifierPattern)) {
+        $kind = ($entry.Groups['kind'].Value -replace '[\s-]', '').ToLowerInvariant()
+        $label = switch ($kind) {
+            'trackingid' { 'TrackingId' }
+            'correlationid' { 'CorrelationId' }
+            'clientrequestid' { 'ClientRequestId' }
+            default { 'RequestId' }
+        }
+        $identifiers.Add("$label=$($entry.Groups['value'].Value)")
+    }
+
+    return [pscustomobject]@{
+        Codes = @($codes | Select-Object -Unique)
+        Identifiers = @($identifiers | Select-Object -Unique)
+    }
 }
 
 function Invoke-WithTransientRetry {
@@ -3574,6 +3607,41 @@ function Get-AzureResourceTool {
     return $null
 }
 
+function Write-AzureCliBillingDiagnostic {
+    <# .SYNOPSIS Records the non-secret Azure CLI and billing request context needed for support. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Tool,
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$ResourceName,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId
+    )
+
+    $cliVersion = '<unavailable>'
+    $extensionVersion = '<not installed; not required for ARM validation>'
+    try {
+        $versionOutput = & az version --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $version = @((ConvertFrom-AzureCliJson -Output $versionOutput) | Select-Object -First 1)
+            if ($version.Count -gt 0) {
+                $reportedCliVersion = Get-ObjectPropertyValue -InputObject $version[0] -Names 'azure-cli'
+                if (-not [string]::IsNullOrWhiteSpace($reportedCliVersion)) { $cliVersion = [string]$reportedCliVersion }
+                $extensions = Get-ObjectPropertyValue -InputObject $version[0] -Names 'extensions'
+                $reportedExtensionVersion = Get-ObjectPropertyValue -InputObject $extensions -Names 'graphservices'
+                if (-not [string]::IsNullOrWhiteSpace($reportedExtensionVersion)) { $extensionVersion = [string]$reportedExtensionVersion }
+            }
+        }
+        else { $cliVersion = "<version command exited $LASTEXITCODE>" }
+    }
+    catch { $cliVersion = "<version command failed: $($_.Exception.Message)>" }
+
+    $applicationTenant = if ([string]::IsNullOrWhiteSpace($TenantId)) { '<not supplied>' } else { $TenantId }
+    Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+        "Tool=Azure CLI $cliVersion; executable=$($Tool.Detail); graphservices extension=$extensionVersion; subscription=$SubscriptionId; application tenant=$applicationTenant; application=$ClientId; resource=$ResourceGroup/$ResourceName."
+}
+
 function Install-AzureCommandLine {
     <# .SYNOPSIS Installs the Azure CLI, which is self-contained and so cannot hit the module assembly clash. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
@@ -3752,7 +3820,7 @@ function Test-MeteredBillingPreflight {
     )
 
     if ($Tool.Kind -ne 'AzureCli') {
-        return [pscustomobject]@{Ready = $false; Message = 'This preflight must run inside the isolated Az worker for the Azure PowerShell route.'}
+        return [pscustomobject]@{Ready = $false; FailureKind = 'Prerequisite'; Message = 'This preflight must run inside the isolated Az worker for the Azure PowerShell route.'}
     }
 
     $problems = [System.Collections.Generic.List[string]]::new()
@@ -3766,8 +3834,12 @@ function Test-MeteredBillingPreflight {
         if ($LASTEXITCODE -ne 0) {
             $problems.Add("Azure could not read the active cloud: $(("$cloudName" -replace '\s+', ' ').Trim())")
         }
-        elseif ("$cloudName".Trim() -ne 'AzureCloud') {
-            $problems.Add("Azure CLI is set to '$(("$cloudName").Trim())'. Metered Graph APIs require the global AzureCloud environment.")
+        else {
+            $cloudName = "$cloudName".Trim()
+            Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result "Active Azure cloud=$cloudName."
+            if ($cloudName -ne 'AzureCloud') {
+                $problems.Add("Azure CLI is set to '$cloudName'. Metered Graph APIs require the global AzureCloud environment.")
+            }
         }
 
         $accountOutput = & az account show --subscription $SubscriptionId --output json --only-show-errors 2>&1
@@ -3782,6 +3854,8 @@ function Test-MeteredBillingPreflight {
             else {
                 $accountTenantId = Get-ObjectPropertyValue -InputObject $account[0] -Names 'tenantId', 'homeTenantId'
                 $accountState = Get-ObjectPropertyValue -InputObject $account[0] -Names 'state'
+                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                    "Subscription state=$accountState; subscription tenant=$accountTenantId."
                 if (-not [string]::IsNullOrWhiteSpace($accountState) -and $accountState -ne 'Enabled') {
                     $problems.Add("Subscription $SubscriptionId is in state '$accountState', not Enabled.")
                 }
@@ -3792,22 +3866,46 @@ function Test-MeteredBillingPreflight {
             }
         }
 
-        $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId --output none --only-show-errors 2>&1
+        $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId --query location --output tsv --only-show-errors 2>&1
         if ($LASTEXITCODE -ne 0) {
             $problems.Add("Resource group '$ResourceGroup' cannot be read in subscription ${SubscriptionId}: $(("$groupOutput" -replace '\s+', ' ').Trim())")
         }
-
-        $providerState = & az provider show --namespace Microsoft.GraphServices --subscription $SubscriptionId `
-            --query registrationState --output tsv --only-show-errors 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $problems.Add("Azure could not read Microsoft.GraphServices registration: $(("$providerState" -replace '\s+', ' ').Trim())")
+        else {
+            Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                "Resource group=$ResourceGroup; location=$("$groupOutput".Trim()); read check=succeeded."
         }
-        elseif ("$providerState".Trim() -ne 'Registered') {
-            $problems.Add("Microsoft.GraphServices is '$(("$providerState").Trim())', not Registered.")
+
+        $providerOutput = & az provider show --namespace Microsoft.GraphServices --subscription $SubscriptionId `
+            --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $problems.Add("Azure could not read Microsoft.GraphServices registration: $(($providerOutput -replace '\s+', ' ').Trim())")
+        }
+        else {
+            $provider = @((ConvertFrom-AzureCliJson -Output $providerOutput) | Select-Object -First 1)
+            if ($provider.Count -eq 0) {
+                $problems.Add('Azure returned no readable details for Microsoft.GraphServices registration.')
+            }
+            else {
+                $providerState = [string](Get-ObjectPropertyValue -InputObject $provider[0] -Names 'registrationState')
+                $accountResourceType = @(@(Get-ObjectPropertyValue -InputObject $provider[0] -Names 'resourceTypes') | Where-Object {
+                        [string](Get-ObjectPropertyValue -InputObject $_ -Names 'resourceType') -eq 'accounts'
+                    } | Select-Object -First 1)
+                $providerApiVersions = if ($accountResourceType.Count -gt 0) {
+                    @((Get-ObjectPropertyValue -InputObject $accountResourceType[0] -Names 'apiVersions') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                }
+                else { @() }
+                $apiVersionText = if ($providerApiVersions.Count -gt 0) { $providerApiVersions -join ', ' } else { '<not advertised>' }
+                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                    "Microsoft.GraphServices registration=$providerState; accounts API versions=$apiVersionText."
+                if ($providerState -ne 'Registered') {
+                    $problems.Add("Microsoft.GraphServices is '$providerState', not Registered.")
+                }
+            }
         }
 
         if ($problems.Count -eq 0) {
             $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-validate-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
+            $validationName = [System.IO.Path]::GetFileNameWithoutExtension($templatePath)
             try {
                 $template = [ordered]@{
                     '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
@@ -3821,8 +3919,10 @@ function Test-MeteredBillingPreflight {
                         })
                 }
                 Set-Content -LiteralPath $templatePath -Value ($template | ConvertTo-Json -Depth 8) -Encoding utf8 -ErrorAction Stop
+                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                    "Validation deployment=$validationName; resource type=Microsoft.GraphServices/accounts; API version=2023-04-13; location=global."
                 $validation = & az deployment group validate --subscription $SubscriptionId --resource-group $ResourceGroup `
-                    --template-file $templatePath --only-show-errors 2>&1
+                    --name $validationName --template-file $templatePath --only-show-errors 2>&1
                 if ($LASTEXITCODE -ne 0) {
                     $problems.Add("Azure Resource Manager could not validate the billing resource deployment: $(("$validation" -replace '\s+', ' ').Trim())")
                 }
@@ -3837,9 +3937,11 @@ function Test-MeteredBillingPreflight {
     }
 
     if ($problems.Count -gt 0) {
-        return [pscustomobject]@{Ready = $false; Message = ($problems -join ' ')}
+        $message = $problems -join ' '
+        $failureKind = if (Test-AzureProviderImplementationFailure -Message $message) { 'ProviderFault' } else { 'Prerequisite' }
+        return [pscustomobject]@{Ready = $false; FailureKind = $failureKind; Message = $message}
     }
-    return [pscustomobject]@{Ready = $true; Message = "Global Azure, subscription $SubscriptionId, resource group '$ResourceGroup', Microsoft.GraphServices, and ARM deployment validation are ready for the documented billing association command."}
+    return [pscustomobject]@{Ready = $true; FailureKind = 'None'; Message = "Global Azure, subscription $SubscriptionId, resource group '$ResourceGroup', Microsoft.GraphServices, and ARM deployment validation are ready for the documented billing association command."}
 }
 
 function Set-MeteredBillingResourceDirect {
@@ -4108,8 +4210,11 @@ try {
                 $null = Test-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -TemplateObject $validationTemplate -ErrorAction Stop
             }
             catch {
-                $result.Status = 'PreflightFailed'
                 $result.Message = "Azure Resource Manager could not validate the billing resource deployment: $($_.Exception.Message)"
+                if ($result.Message -match '(?is)(TryCreateLogger|OpenTelemetry(?:\.Logs\.)?LoggerProviderSdk).*cannot\W*reduce\W*access') {
+                    $result.Status = 'ProviderFault'
+                }
+                else { $result.Status = 'PreflightFailed' }
                 break
             }
             $result.Message = 'Global Azure, subscription, resource group, Microsoft.GraphServices, and ARM deployment validation are ready.'
@@ -4459,9 +4564,14 @@ function Set-MeteredBillingLink {
 
     $script:LastBillingPreflightFailed = $false
     $script:LastBillingWasProviderFault = $false
+    $script:LastBillingWasServiceFault = $false
+    $script:LastBillingWasClientFault = $false
+    $script:LastBillingFailureSignature = ''
     try {
         if ($Tool.Kind -eq 'AzureCli') {
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Using the Azure CLI. A browser sign-in may appear if the CLI is not already signed in.'
+            Write-AzureCliBillingDiagnostic -Tool $Tool -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
+                -ResourceName $ResourceName -ClientId $ClientId -TenantId $TenantId
             # Every command receives the subscription explicitly, so this utility never changes the
             # default subscription of an Azure CLI session that was already open.
             if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
@@ -4482,8 +4592,20 @@ function Set-MeteredBillingLink {
             $preflight = Test-MeteredBillingPreflight -Tool $Tool -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
                 -ResourceName $ResourceName -ClientId $ClientId -TenantId $TenantId
             if (-not $preflight.Ready) {
-                $script:LastBillingPreflightFailed = $true
                 Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason $preflight.Message
+                $diagnostic = Get-AzureFailureDiagnostic -Message $preflight.Message
+                $codeText = if ($diagnostic.Codes.Count -gt 0) { $diagnostic.Codes -join ' > ' } else { '<none parsed>' }
+                $identifierText = if ($diagnostic.Identifiers.Count -gt 0) { $diagnostic.Identifiers -join ', ' } else { '<none parsed>' }
+                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                    "Preflight classification=$($preflight.FailureKind); error codes=$codeText; support identifiers=$identifierText."
+                if ($preflight.FailureKind -eq 'ProviderFault') {
+                    $script:LastBillingWasProviderFault = $true
+                    $script:LastBillingWasServiceFault = $true
+                    $script:LastBillingFailureSignature = Get-FailureSignature -Message $preflight.Message
+                }
+                else {
+                    $script:LastBillingPreflightFailed = $true
+                }
                 return $false
             }
             Write-RunLog -Severity SUCCESS -Action 'Preflight metered billing' -Result $preflight.Message
@@ -4533,6 +4655,13 @@ function Set-MeteredBillingLink {
             }
             if ($response.Status -eq 'PreflightFailed') {
                 $script:LastBillingPreflightFailed = $true
+                Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason ([string]$response.Message)
+                return $false
+            }
+            if ($response.Status -eq 'ProviderFault') {
+                $script:LastBillingWasProviderFault = $true
+                $script:LastBillingWasServiceFault = $true
+                $script:LastBillingFailureSignature = Get-FailureSignature -Message ([string]$response.Message)
                 Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason ([string]$response.Message)
                 return $false
             }
@@ -5116,6 +5245,16 @@ function Wait-ForBillingLink {
     # Nothing here waits on a timer: every route was already tried and refused the same way, so a
     # later attempt through the same code returns the same answer.
     Write-Host ''
+    if ($script:LastBillingWasProviderFault) {
+        Write-Host '  Microsoft.GraphServices failed its own validation endpoint while loading its' -ForegroundColor Yellow
+        Write-Host '  OpenTelemetry assemblies. No create command was sent, and this is not a problem' -ForegroundColor Yellow
+        Write-Host '  with your subscription, tenant, resource group, or authorization.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  The exact billing link is saved, but startup will not retry this provider fault.' -ForegroundColor Gray
+        Write-Host '  Run setup again after Microsoft repairs the provider or Azure support resolves it.' -ForegroundColor Gray
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The pending link was retained without an automatic retry because Microsoft.GraphServices returned its known OpenTelemetry type-load failure.'
+        return $false
+    }
     if ($script:LastBillingWasClientFault) {
         Write-Host '  The Azure module could not load in its own process on this machine, so the request' -ForegroundColor Yellow
         Write-Host '  never reached Azure at all. Retrying it here would fail the same way.' -ForegroundColor Yellow
