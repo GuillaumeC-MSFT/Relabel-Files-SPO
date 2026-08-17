@@ -1711,9 +1711,11 @@ function Get-PowerShell7Path {
 }
 
 function Restart-InPowerShell7 {
-    <# .SYNOPSIS Decides whether to hand this run over to PowerShell 7; the launch itself happens at script level. #>
+    <# .SYNOPSIS Decides whether to hand this run over to PowerShell 7 with source choice preserved. #>
     [CmdletBinding()]
-    param()
+    param(
+        [ValidateSet('Local', 'SharePoint')][string]$Source = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($script:ScriptPath) -or -not (Test-Path -LiteralPath $script:ScriptPath -PathType Leaf)) {
         Write-RunLog -Severity WARN -Action 'Restart in PowerShell 7' -Result 'This utility could not locate its own script file, so it cannot restart itself.'
@@ -1726,7 +1728,7 @@ function Restart-InPowerShell7 {
     }
 
     $choice = Read-MenuChoice -Title "Restart this utility in $hostPath so the SharePoint source can be used?" -Options ([ordered]@{
-            '1' = 'Yes, restart now (the Microsoft 365 sign-in has to be repeated there)'
+            '1' = 'Yes, restart now (your authentication will be reused)'
             '2' = 'No, stay here and choose the local or UNC source'
         }) -Default '1'
     if ($choice -ne '1') { return $false }
@@ -1736,6 +1738,10 @@ function Restart-InPowerShell7 {
     # function has its console output captured as that function's return value.
     $script:RelaunchHostPath = $hostPath
     $script:RelaunchCompleted = $true
+    # Preserve the source choice and the reason for restart
+    if (-not [string]::IsNullOrWhiteSpace($Source)) {
+        $script:RelaunchReason = "source choice ($Source)"
+    }
     return $true
 }
 
@@ -2547,8 +2553,9 @@ function Read-FileSource {
     while ($true) {
         $sourceChoice = Read-MenuChoice -Title 'Where are the files?' -Options ([ordered]@{
                 '1' = 'Local or UNC folder (Purview Information Protection client)'
-                '2' = 'SharePoint Online document library (PnP PowerShell and Microsoft Graph)'
+                '2' = 'SharePoint Online document library (PowerShell 7, PnP, and Microsoft Graph)'
             }) -Default '1'
+        
         if ($sourceChoice -ne '2') {
             # Local source selected. Ensure Purview client is available.
             if (-not (Get-Module -ListAvailable -Name PurviewInformationProtection -ErrorAction SilentlyContinue)) {
@@ -2559,15 +2566,24 @@ function Read-FileSource {
             }
             return 'Local'
         }
-        # SharePoint source selected. Ensure PowerShell modules are available.
-        if (Test-SharePointSourceAvailable) {
-            if (-not (Install-SharePointModules -Confirm:$false)) {
-                Write-RunLog -Severity WARN -Action 'Select source' -Result 'SharePoint Online requires additional PowerShell modules. Cannot proceed without them.'
-                continue
+        
+        # SharePoint source selected. Check PowerShell version first.
+        if ($PSVersionTable.PSVersion -lt [version]'7.2.0') {
+            Write-RunLog -Severity WARN -Action 'Select source' -Result "SharePoint Online labeling requires PowerShell 7.2 or later. This host is Windows PowerShell $($PSVersionTable.PSVersion)."
+            if (Restart-InPowerShell7 -Source 'SharePoint') {
+                return ''  # Restart in progress, will relaunch with -InitialSource SharePoint
             }
-            return 'SharePoint'
+            Write-RunLog -Severity INFO -Action 'Select source' -Result 'The local or UNC source works in this host and is the better choice for the Purview Information Protection client.'
+            continue  # Ask again, let user pick local source or try PowerShell 7 again
         }
-        if ($script:RelaunchCompleted) { return '' }
+        
+        # PowerShell 7+ confirmed. Now ensure SharePoint modules are installed.
+        if (-not (Install-SharePointModules -Confirm:$false)) {
+            Write-RunLog -Severity WARN -Action 'Select source' -Result 'SharePoint Online requires additional PowerShell modules. Cannot proceed without them.'
+            continue
+        }
+        
+        return 'SharePoint'
     }
 }
 
