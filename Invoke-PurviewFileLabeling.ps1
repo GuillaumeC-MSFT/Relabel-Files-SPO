@@ -2026,12 +2026,14 @@ try {
     $arguments = if ([string]::IsNullOrWhiteSpace($ArgumentJson)) { @{} } else { ConvertFrom-Json $ArgumentJson -AsHashtable }
     $context = Get-MgContext -ErrorAction SilentlyContinue
     $sameTenant = $context -and ([string]::IsNullOrWhiteSpace($TenantId) -or [string]$context.TenantId -eq $TenantId)
-    if (-not $sameTenant -and $Action -ne 'SignOut') {
+    $requestedScopes = @(($ScopeList -split ',') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $missingScopes = @($requestedScopes | Where-Object { $null -eq $context -or @($context.Scopes) -notcontains $_ })
+    if ((-not $sameTenant -or $missingScopes.Count -gt 0) -and $Action -ne 'SignOut') {
         if ($NoPrompt) {
             $result.Status = 'NoSession'
-            throw 'No Microsoft Graph sign-in exists yet.'
+            throw 'No Microsoft Graph sign-in with the required tenant and scopes exists yet.'
         }
-        $connect = @{ Scopes = ($ScopeList -split ','); NoWelcome = $true; ErrorAction = 'Stop' }
+        $connect = @{ Scopes = $requestedScopes; NoWelcome = $true; ErrorAction = 'Stop' }
         if ((Get-Command Connect-MgGraph).Parameters.ContainsKey('ContextScope')) { $connect.ContextScope = 'CurrentUser' }
         if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $connect.TenantId = $TenantId }
         if ($UseDeviceCode) { $connect.UseDeviceCode = $true }
@@ -2091,6 +2093,32 @@ try {
         'Consent' {
             $clientId = [string]$arguments['ClientId']
             $application = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications(appId='$clientId')" -ErrorAction Stop
+            $applicationObjectId = [string](Get-Value $application 'id')
+            if ([string]::IsNullOrWhiteSpace($applicationObjectId)) { throw 'The application registration has no directory object ID.' }
+
+            # Register-PnPEntraIDApp can create an ownerless registration. Microsoft requires the
+            # billing operator to own the application, so make this administrator an explicit owner.
+            $operator = Invoke-MgGraphRequest -Method GET -Uri 'https://graph.microsoft.com/v1.0/me' -ErrorAction Stop
+            $operatorId = [string](Get-Value $operator 'id')
+            if ([string]::IsNullOrWhiteSpace($operatorId)) { throw 'Microsoft Graph did not return the signed-in administrator object ID.' }
+            $ownerResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$applicationObjectId/owners" -ErrorAction Stop
+            $ownerIds = @(@(Get-Value $ownerResponse 'value') | ForEach-Object { [string](Get-Value $_ 'id') })
+            if ($ownerIds -notcontains $operatorId) {
+                $ownerBody = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$operatorId" } | ConvertTo-Json
+                try {
+                    $null = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/applications/$applicationObjectId/owners/`$ref" -Body $ownerBody -ContentType 'application/json' -ErrorAction Stop
+                }
+                catch {
+                    if ((Get-Detail $_) -notmatch '(?i)already exist|added object references') { throw }
+                }
+                $ownerResponse = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$applicationObjectId/owners" -ErrorAction Stop
+                $ownerIds = @(@(Get-Value $ownerResponse 'value') | ForEach-Object { [string](Get-Value $_ 'id') })
+                if ($ownerIds -notcontains $operatorId) { throw "Application owner assignment for object $operatorId could not be verified." }
+            }
+            $operatorName = [string](Get-Value $operator 'userPrincipalName')
+            if ([string]::IsNullOrWhiteSpace($operatorName)) { $operatorName = [string](Get-Value $operator 'displayName') }
+            if ([string]::IsNullOrWhiteSpace($operatorName)) { $operatorName = $operatorId }
+
             $principal = Get-Principal -AppId $clientId
             $principalId = [string](Get-Value $principal 'id')
             if ([string]::IsNullOrWhiteSpace($principalId)) {
@@ -2120,7 +2148,7 @@ try {
                     catch { if ((Get-Detail $_) -match '(?i)already exists|Permission being assigned') { $granted++ } else { throw } }
                 }
             }
-            $result.Status = 'Granted'; $result.Count = $granted
+            $result.Status = 'Granted'; $result.Count = $granted; $result.Value = $operatorName
             if ($requested -eq 0) { $result.Message = 'The registration requests no application permissions, so there was nothing to consent to.' }
         }
         'RemoveApp' {
@@ -3576,6 +3604,7 @@ function Show-AdminConsentInstruction {
     Write-Host '  Grant it in the Entra admin center (https://entra.microsoft.com):' -ForegroundColor Gray
     Write-Host '    Identity > Applications > App registrations > All applications' -ForegroundColor DarkGray
     Write-Host "    open the application with ID $ClientId" -ForegroundColor DarkGray
+    Write-Host '    Owners > Add owners > select the account that will run Azure billing setup' -ForegroundColor DarkGray
     Write-Host '    API permissions > Grant admin consent for <your tenant>' -ForegroundColor DarkGray
     Write-Host ''
 }
@@ -3616,7 +3645,7 @@ function Grant-LabelingAdminConsent {
 
     if (-not $PSCmdlet.ShouldProcess("application $ClientId", 'Create the service principal and grant its application permissions')) { return $false }
 
-    Write-RunLog -Severity INFO -Action 'Grant admin consent' -Result 'Signing in to Microsoft Graph, in a separate process. Use an account that can administer app registrations.'
+    Write-RunLog -Severity INFO -Action 'Grant admin consent' -Result 'Signing in to Microsoft Graph, in a separate process. Use an account that can administer app registrations; this account is also assigned as the application owner for Azure billing setup.'
     if (-not $script:UseDeviceCode) {
         Write-Host ''
         Write-Host '  A sign-in window opens now. Windows may place it behind this one, so check' -ForegroundColor Cyan
@@ -3624,13 +3653,13 @@ function Grant-LabelingAdminConsent {
         Write-Host '  sign in with a code instead.' -ForegroundColor Gray
     }
     $response = Invoke-GraphAction -Action 'Consent' -TenantId $TenantId -Arguments @{ClientId = $ClientId} `
-        -Scopes @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All')
+        -Scopes @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All', 'User.Read')
     if ($response.Status -eq 'Granted') {
         if ([int]$response.Count -eq 0) {
             Write-RunLog -Severity WARN -Action 'Grant admin consent' -Result "The service principal exists, but no application permission was assigned. $($response.Message)"
             return $false
         }
-        Write-RunLog -Severity SUCCESS -Action 'Grant admin consent' -Result "Consent is granted: $($response.Count) application permission(s) are assigned to $ClientId in tenant $TenantId."
+        Write-RunLog -Severity SUCCESS -Action 'Grant admin consent' -Result "Consent is granted: $($response.Count) application permission(s) are assigned to $ClientId in tenant $TenantId, and $($response.Value) is verified as an application owner. Use that same account for Azure billing setup unless another billing operator is added as an owner."
         return $true
     }
     # Consent instructions would be nonsense for an application the directory does not have.
@@ -3930,7 +3959,7 @@ function Test-MeteredBillingPreflight {
                     Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result 'Application owner check=succeeded for the signed-in Azure CLI user.'
                 }
                 else {
-                    $problems.Add("The signed-in Azure CLI user is not listed as an owner of application $ClientId. Microsoft requires application owner permissions for the billing association.")
+                    $problems.Add("The signed-in Azure CLI user (object ID $operatorId) is not listed as an owner of application $ClientId. Azure subscription ownership and Entra application ownership are separate permissions; subscription Owner does not grant application ownership. Sign Azure CLI in as an application owner that also has Contributor or Owner on subscription $SubscriptionId, or ask a current application owner or authorized Entra administrator to run: az ad app owner add --id $ClientId --owner-object-id $operatorId. Then rerun option 3 and keep the existing application, certificate, resource group, and billing-resource name; do not register another application.")
                 }
             }
             else {
@@ -4878,7 +4907,7 @@ function Invoke-MeteredSetup {
         Write-Host "  Certificate $($existing.Thumbprint) is $certificateState." -ForegroundColor Gray
         $choice = Read-MenuChoice -Title 'What should happen to it?' -Options ([ordered]@{
                 '1' = 'Keep it and only (re)link Azure billing'
-                '2' = 'Grant administrator consent for it, which app-only sign-in needs'
+                '2' = 'Grant administrator consent and ensure the billing operator is an app owner'
                 '3' = 'Replace it with a newly registered application'
                 '4' = 'Forget it, so this utility returns to survey-only mode'
                 '5' = 'Return to the main menu'
@@ -4963,8 +4992,9 @@ function Invoke-MeteredSetup {
     Write-Host "  Certificate : $($application.Thumbprint)  (Cert:\CurrentUser\My)" -ForegroundColor Green
     Write-Host ''
     Write-Host '  Registering created the application, but app-only sign-in also needs a service' -ForegroundColor Yellow
-    Write-Host '  principal, and only administrator consent creates one. Until then sign-in fails' -ForegroundColor Yellow
-    Write-Host '  with AADSTS700016 and this utility stays read-only.' -ForegroundColor Yellow
+    Write-Host '  principal and administrator consent. The next step also makes its signed-in' -ForegroundColor Yellow
+    Write-Host '  administrator an explicit application owner, which Azure billing requires.' -ForegroundColor Yellow
+    Write-Host '  Until consent is complete, sign-in fails with AADSTS700016 and this utility stays read-only.' -ForegroundColor Yellow
     $consentChoice = Read-MenuChoice -Title 'Grant administrator consent now?' -Options ([ordered]@{
             '1' = 'Yes, sign in as an administrator and grant it from here'
             '2' = 'No, I will grant it in the Entra admin center'
@@ -5015,7 +5045,7 @@ function Connect-AzureCommandLine {
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
-            Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure CLI sign-in. Use the account that owns the subscription to be billed.'
+            Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure CLI sign-in. Use one account that is an owner of the application registration and has Contributor or Owner access to the subscription being billed.'
             $arguments = [System.Collections.Generic.List[string]]::new()
             $arguments.Add('login')
             if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $arguments.Add('--tenant'); $arguments.Add($TenantId) }
