@@ -5,6 +5,10 @@ Relabel-Files-*.csv
 New-LabelTestSite-*.log
 LabelTestSiteCleanup-*.json
 
+# Development-only validation and repository automation are not part of the published utility.
+/Tests/
+/.github/
+
 # Certificates, in case one is ever exported next to the scripts.
 *.pfx
 *.p12

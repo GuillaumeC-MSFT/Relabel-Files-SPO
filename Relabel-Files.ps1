@@ -3526,9 +3526,9 @@ function Show-MeteredBillingCommand {
     $nameText = if ([string]::IsNullOrWhiteSpace($ResourceName)) { '<billing-resource-name>' } else { $ResourceName }
     Write-Host ''
     Write-Host '  Run these in Azure Cloud Shell (https://shell.azure.com) or a local Azure CLI:' -ForegroundColor Cyan
-    Write-Host "    az extension add --name graph-services" -ForegroundColor DarkGray
+    Write-Host "    az extension add --name graphservices --allow-preview true --upgrade --yes" -ForegroundColor DarkGray
     Write-Host "    az account set --subscription $subscriptionText" -ForegroundColor DarkGray
-    Write-Host "    az provider register --namespace Microsoft.GraphServices --subscription $subscriptionText" -ForegroundColor DarkGray
+    Write-Host "    az provider register --namespace Microsoft.GraphServices --subscription $subscriptionText --wait" -ForegroundColor DarkGray
     Write-Host "    az graph-services account create --resource-group $groupText --resource-name $nameText --subscription $subscriptionText --location global --app-id $ClientId" -ForegroundColor DarkGray
     Write-Host '    az resource list --resource-type Microsoft.GraphServices/accounts' -ForegroundColor DarkGray
     Write-Host ''
@@ -3965,9 +3965,9 @@ function Invoke-BillingLinkInCloudShell {
     Write-Host '  installed. This machine takes no part, so nothing here can refuse it. This is also the' -ForegroundColor Gray
     Write-Host '  route Microsoft documents for creating this resource.' -ForegroundColor Gray
 
-    $command = 'az extension add --name graph-services --only-show-errors; ' +
+    $command = 'az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors; ' +
         "az account set --subscription $SubscriptionId; " +
-        'az provider register --namespace Microsoft.GraphServices; ' +
+        "az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --wait --only-show-errors; " +
         "az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName --subscription $SubscriptionId --location global --app-id $ClientId"
 
     $copied = $false
@@ -4047,8 +4047,8 @@ function Set-MeteredBillingLink {
     try {
         if ($Tool.Kind -eq 'AzureCli') {
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Using the Azure CLI. A browser sign-in may appear if the CLI is not already signed in.'
-            # graph-services ships as a CLI extension, so a first run would otherwise stop on an interactive install prompt.
-            $null = & az extension add --name graph-services --only-show-errors 2>&1
+            # The graph-services command group ships in the graphservices extension package.
+            $null = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
             $null = & az account set --subscription $SubscriptionId 2>&1
             if (Test-MeteredBillingResource -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
                 Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' already exists in $ResourceGroup, so nothing needed creating."

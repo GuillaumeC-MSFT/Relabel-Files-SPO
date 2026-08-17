@@ -374,19 +374,9 @@ Each run creates timestamped `.log` and `.csv` files. The CSV records every proc
 
 For the local source, the utility uses `Get-FileStatus` per file and calls `Set-FileLabel -PreserveFileDetails` only after apply mode and explicit confirmation. For the SharePoint source it reads labels with `Get-PnPFileSensitivityLabel`, and never writes. Note the near-identical `Get-PnPFileSensitivityLabelInfo`: despite the more descriptive name it is a SharePoint tenant-admin CSOM call that fails with `Attempted to perform an unauthorized operation` for anyone who is not a SharePoint Administrator, so this utility deliberately does not use it. Failures are collected and reported instead of terminating the whole run. Operator menus allow retry, changed input, skip, main menu, or clean exit. Every session it opens, to Security &amp; Compliance PowerShell or to SharePoint, is closed on exit.
 
+At startup the utility records its version, the host, and the version of every module it can use into the run log, and warns when one is older than expected.
+
 PowerShell execution policy may block local scripts. Follow the customer's approved policy; do not weaken organization-wide policy solely to run this utility.
-
-## Keeping it working
-
-The tests in `Tests` check the repository itself and the decisions the utility makes. They write nothing and connect to nothing, so they are safe to run at any time:
-
-```powershell
-Invoke-Pester -Path .\Tests -Output Detailed
-```
-
-They parse both scripts under PowerShell 7 and Windows PowerShell 5.1, parse the embedded worker scripts that run in child processes, and check that Az and Microsoft Graph never load into a session that also uses PnP. That last check is the important one: those modules ship incompatible `Microsoft.Extensions` assemblies, and whichever loads first wins for the life of the process, so mixing them breaks SharePoint sign-in with a missing `get_Services` implementation. They also verify approved verbs, that every function is both reachable and resolvable, that no script-scope variable is read before it is ever assigned, and that PSScriptAnalyzer reports nothing. GitHub Actions runs them on every push.
-
-Each check exists because something once broke in the way it detects, so a check that finds nothing to inspect fails rather than passing quietly. At startup the utility also records its version, the host, and the version of every module it can use into the run log, and warns when one is older than expected.
 
 ## As-Is Disclaimer
 
