@@ -356,8 +356,8 @@ Everything starts from one menu, and every option returns to it:
 
 | Option | What it does |
 | --- | --- |
-| 1. Guided run | Applies one label to one folder or library, with the prompts listed above. |
-| 2. Batch run from a CSV | Applies a different label per folder in a single pass. See below. |
+| 1. Guided run | Applies one label to the matching files in one folder or library, optionally including subfolders. |
+| 2. Batch run from a CSV | Applies a different label to the matching files in each listed folder. See below. |
 | 3. Enable SharePoint Online metered label writing | One-time setup that registers a confidential client, grants its administrator consent, and links Azure billing, so the SPO source can apply labels instead of only surveying. Also re-links billing, grants consent for an existing application, replaces it, or forgets it. |
 | 4. Change where the files are | Switches between the local/UNC/SharePoint Server file-path source and native SharePoint Online without restarting. |
 | 5. Forget settings remembered from previous runs | Lists every value this utility remembers, with its scope, and clears them on confirmation. Also signs out of Microsoft Graph, which is otherwise kept so later runs do not prompt. Variables owned by other tools are listed but never modified. |
@@ -376,7 +376,7 @@ Option 3 changes what the other options can do, and it is the only one that can 
 
 ## Batch runs from a CSV
 
-A guided run applies one label to one folder. When different folders need different labels, the main menu's batch option takes a CSV instead, so one sign-in covers the whole set:
+A guided run applies one label to the contents of one folder or library. Here, *contents* means the matching files selected by the extension filter, optionally including subfolders; the folder object itself is not labeled. When different folders' contents need different labels, the main menu's batch option takes a CSV instead, so one sign-in covers the whole set:
 
 ```csv
 Folder,Label,Recurse,Extensions

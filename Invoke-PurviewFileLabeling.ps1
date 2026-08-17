@@ -5822,8 +5822,8 @@ try {
     while (-not $exitRequested) {
         $sourceLabel = if ($script:Source -eq 'SharePoint') { 'SharePoint Online (metered API for Apply)' } else { 'local/UNC/SharePoint Server path (Purview client)' }
         $mainChoice = Read-MenuChoice -Title "Main menu  (files: $sourceLabel)" -Options ([ordered]@{
-                '1' = 'Start a guided run (one label for one folder)'
-                '2' = 'Start a batch run from a CSV (a different label per folder)'
+                '1' = "Start a guided run (one label for one folder's contents)"
+                '2' = "Start a batch run from a CSV (a different label for each folder's contents)"
                 '3' = 'Enable SharePoint Online metered label writing (certificate and Azure billing)'
                 '4' = "Change where the files are (currently $sourceLabel)"
                 '5' = 'Forget settings remembered from previous runs (and sign out of Microsoft Graph)'
