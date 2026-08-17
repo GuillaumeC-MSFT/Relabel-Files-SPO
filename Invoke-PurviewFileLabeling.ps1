@@ -75,7 +75,6 @@ $script:LastBillingWasClientFault = $false
 $script:LastBillingFailureSignature = ''
 $script:LastBillingPreflightFailed = $false
 $script:LastBillingResourceStatus = $null
-$script:LastBillingFallbackError = ''
 # Every certificate this run generates is tracked, so nothing it created outlives its use.
 $script:CreatedCertificateThumbprints = [System.Collections.Generic.List[string]]::new()
 # Windows PowerShell writes a BOM for 'utf8' and PowerShell 7 does not, yet Excel needs one to read non-ASCII paths correctly.
@@ -3620,7 +3619,7 @@ function Write-AzureCliBillingDiagnostic {
     )
 
     $cliVersion = '<unavailable>'
-    $extensionVersion = '<not installed; not required for ARM validation>'
+    $extensionVersion = '<not installed yet>'
     try {
         $versionOutput = & az version --output json --only-show-errors 2>&1
         if ($LASTEXITCODE -eq 0) {
@@ -3706,14 +3705,8 @@ function Show-MeteredBillingCommand {
     Write-Host "    az account set --subscription $subscriptionText" -ForegroundColor DarkGray
     Write-Host "    az provider register --namespace Microsoft.GraphServices --subscription $subscriptionText --wait" -ForegroundColor DarkGray
     Write-Host "    az graph-services account create --resource-group $groupText --resource-name $nameText --subscription $subscriptionText --location global --app-id $ClientId" -ForegroundColor DarkGray
-    Write-Host '    az resource list --resource-type Microsoft.GraphServices/accounts' -ForegroundColor DarkGray
-    Write-Host ''
-    Write-Host '  The preview extension is not the only route. If the create above returns' -ForegroundColor Cyan
-    Write-Host '  InternalServerError, this one uses no extension and names the API version.' -ForegroundColor Cyan
-    Write-Host '  Run it in Bash, which quotes the JSON most reliably:' -ForegroundColor Cyan
-    Write-Host "    az resource create --subscription $subscriptionText --resource-group $groupText --name $nameText --resource-type Microsoft.GraphServices/accounts --api-version 2023-04-13 --location global --properties '{`"appId`":`"$ClientId`"}'" -ForegroundColor DarkGray
-    Write-Host '  If that is refused too, repeat it with --api-version 2022-09-22-preview,' -ForegroundColor Cyan
-    Write-Host '  which is the only other version this resource type has.' -ForegroundColor Cyan
+    Write-Host "    az resource list --resource-type Microsoft.GraphServices/accounts --subscription $subscriptionText" -ForegroundColor DarkGray
+    Write-Host "    az resource show --resource-group $groupText --name $nameText --resource-type Microsoft.GraphServices/accounts --subscription $subscriptionText" -ForegroundColor DarkGray
     Write-Host ''
     Write-Host '  The resource group must already exist, you need Contributor on the subscription,' -ForegroundColor Gray
     Write-Host '  and owner rights on the application registration.' -ForegroundColor Gray
@@ -3733,6 +3726,9 @@ function Get-MeteredBillingResourceState {
     $propertiesProperty = $Resource.PSObject.Properties['properties']
     $properties = if ($propertiesProperty) { $propertiesProperty.Value } else { $null }
     $actualClientId = Get-ObjectPropertyValue -InputObject $properties -Names 'appId', 'AppId'
+    $billingPlanId = Get-ObjectPropertyValue -InputObject $properties -Names 'billingPlanId', 'BillingPlanId'
+    $resourceType = Get-ObjectPropertyValue -InputObject $Resource -Names 'type', 'Type'
+    $location = Get-ObjectPropertyValue -InputObject $Resource -Names 'location', 'Location'
     $provisioningState = Get-ObjectPropertyValue -InputObject $properties -Names 'provisioningState', 'ProvisioningState'
     if ([string]::IsNullOrWhiteSpace($provisioningState)) {
         $provisioningState = Get-ObjectPropertyValue -InputObject $Resource -Names 'provisioningState', 'ProvisioningState'
@@ -3743,13 +3739,22 @@ function Get-MeteredBillingResourceState {
     if (-not [string]::Equals($actualClientId, $ClientId, [System.StringComparison]::OrdinalIgnoreCase)) {
         return [pscustomobject]@{Status = 'WrongApplication'; Message = "The billing resource is linked to application $actualClientId, not $ClientId."}
     }
+    if ([string]::IsNullOrWhiteSpace($billingPlanId)) {
+        return [pscustomobject]@{Status = 'NotReady'; Message = 'The billing resource does not report a billing plan ID.'}
+    }
+    if (-not [string]::Equals($resourceType, 'Microsoft.GraphServices/accounts', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{Status = 'NotReady'; Message = "Azure returned resource type '$resourceType', not Microsoft.GraphServices/accounts."}
+    }
+    if (-not [string]::Equals($location, 'global', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{Status = 'NotReady'; Message = "The billing resource reports location '$location', not Global."}
+    }
     if ([string]::IsNullOrWhiteSpace($provisioningState)) {
-        return [pscustomobject]@{Status = 'Ready'; Message = "The billing resource is linked to application $ClientId. Azure did not report a provisioning state."}
+        return [pscustomobject]@{Status = 'NotReady'; Message = 'The billing resource does not report a provisioning state.'}
     }
     if ($provisioningState -ne 'Succeeded') {
         return [pscustomobject]@{Status = 'NotReady'; Message = "The billing resource reports state '$provisioningState' rather than Succeeded."}
     }
-    return [pscustomobject]@{Status = 'Ready'; Message = "The billing resource is linked to application $ClientId and is provisioned."}
+    return [pscustomobject]@{Status = 'Ready'; Message = "The billing resource is linked to application $ClientId, has billing plan $billingPlanId, and is provisioned."}
 }
 
 function Test-MeteredBillingResource {
@@ -3814,7 +3819,6 @@ function Test-MeteredBillingPreflight {
         [Parameter(Mandatory)][object]$Tool,
         [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
-        [Parameter(Mandatory)][string]$ResourceName,
         [Parameter(Mandatory)][string]$ClientId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId
     )
@@ -3866,6 +3870,49 @@ function Test-MeteredBillingPreflight {
             }
         }
 
+        $operatorOutput = & az ad signed-in-user show --query id --output tsv --only-show-errors 2>&1
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$operatorOutput")) {
+            $operatorId = "$operatorOutput".Trim()
+            $ownerOutput = & az ad app owner list --id $ClientId --query '[].id' --output tsv --only-show-errors 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $ownerIds = @(("$ownerOutput" -split '\r?\n') | ForEach-Object { $_.Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+                if ($ownerIds -contains $operatorId) {
+                    Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result 'Application owner check=succeeded for the signed-in Azure CLI user.'
+                }
+                else {
+                    $problems.Add("The signed-in Azure CLI user is not listed as an owner of application $ClientId. Microsoft requires application owner permissions for the billing association.")
+                }
+            }
+            else {
+                Write-RunLog -Severity WARN -Action 'Check application owner' -Result "Azure CLI could not list owners for application ${ClientId}: $(("$ownerOutput" -replace '\s+', ' ').Trim()). The documented create command will remain the authoritative check."
+            }
+
+            $subscriptionScope = "/subscriptions/$SubscriptionId"
+            $roleOutput = & az role assignment list --assignee-object-id $operatorId --include-groups --include-inherited `
+                --scope $subscriptionScope --fill-principal-name false --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $assignments = @(ConvertFrom-AzureCliJson -Output $roleOutput)
+                $hasContributorAccess = @($assignments | Where-Object {
+                        $roleName = [string](Get-ObjectPropertyValue -InputObject $_ -Names 'roleDefinitionName')
+                        $roleId = [string](Get-ObjectPropertyValue -InputObject $_ -Names 'roleDefinitionId')
+                        $roleName -in 'Contributor', 'Owner' -or
+                            $roleId -match '(?i)/(b24988ac-6180-42a0-ab88-20f7382dd24c|8e3af657-a8ff-443c-a75c-2fe8c4bcb635)$'
+                    }).Count -gt 0
+                if ($hasContributorAccess) {
+                    Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result 'Subscription role check=succeeded with Contributor or Owner access, including inherited and group assignments.'
+                }
+                else {
+                    $problems.Add("The signed-in Azure CLI user has no Contributor or Owner role at subscription $SubscriptionId, including inherited and group assignments. Microsoft requires Contributor access for the billing association.")
+                }
+            }
+            else {
+                Write-RunLog -Severity WARN -Action 'Check subscription role' -Result "Azure CLI could not list effective role assignments at ${subscriptionScope}: $(("$roleOutput" -replace '\s+', ' ').Trim()). The documented create command will remain the authoritative check."
+            }
+        }
+        else {
+            Write-RunLog -Severity WARN -Action 'Check application owner' -Result "Azure CLI could not identify a signed-in user, so application ownership could not be verified independently. The documented create command will remain the authoritative check. $(("$operatorOutput" -replace '\s+', ' ').Trim())"
+        }
+
         $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId --query location --output tsv --only-show-errors 2>&1
         if ($LASTEXITCODE -ne 0) {
             $problems.Add("Resource group '$ResourceGroup' cannot be read in subscription ${SubscriptionId}: $(("$groupOutput" -replace '\s+', ' ').Trim())")
@@ -3903,34 +3950,6 @@ function Test-MeteredBillingPreflight {
             }
         }
 
-        if ($problems.Count -eq 0) {
-            $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-validate-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
-            $validationName = [System.IO.Path]::GetFileNameWithoutExtension($templatePath)
-            try {
-                $template = [ordered]@{
-                    '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
-                    contentVersion = '1.0.0.0'
-                    resources = @([ordered]@{
-                            type = 'Microsoft.GraphServices/accounts'
-                            apiVersion = '2023-04-13'
-                            name = $ResourceName
-                            location = 'global'
-                            properties = [ordered]@{appId = $ClientId}
-                        })
-                }
-                Set-Content -LiteralPath $templatePath -Value ($template | ConvertTo-Json -Depth 8) -Encoding utf8 -ErrorAction Stop
-                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
-                    "Validation deployment=$validationName; resource type=Microsoft.GraphServices/accounts; API version=2023-04-13; location=global."
-                $validation = & az deployment group validate --subscription $SubscriptionId --resource-group $ResourceGroup `
-                    --name $validationName --template-file $templatePath --only-show-errors 2>&1
-                if ($LASTEXITCODE -ne 0) {
-                    $problems.Add("Azure Resource Manager could not validate the billing resource deployment: $(("$validation" -replace '\s+', ' ').Trim())")
-                }
-            }
-            finally {
-                Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
-            }
-        }
     }
     catch {
         $problems.Add((Get-ErrorText -ErrorRecord $_))
@@ -3941,72 +3960,7 @@ function Test-MeteredBillingPreflight {
         $failureKind = if (Test-AzureProviderImplementationFailure -Message $message) { 'ProviderFault' } else { 'Prerequisite' }
         return [pscustomobject]@{Ready = $false; FailureKind = $failureKind; Message = $message}
     }
-    return [pscustomobject]@{Ready = $true; FailureKind = 'None'; Message = "Global Azure, subscription $SubscriptionId, resource group '$ResourceGroup', Microsoft.GraphServices, and ARM deployment validation are ready for the documented billing association command."}
-}
-
-function Set-MeteredBillingResourceDirect {
-    <# .SYNOPSIS Creates and verifies the billing resource through generic ARM when the Graph Services extension is refused. #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SubscriptionId,
-        [Parameter(Mandatory)][string]$ResourceGroup,
-        [Parameter(Mandatory)][string]$ResourceName,
-        [Parameter(Mandatory)][string]$ClientId,
-        [Parameter(Mandatory)][object]$Tool
-    )
-
-    # Passed as a file because inline JSON is mangled differently by every shell this may run in.
-    $propertiesPath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
-    $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-template-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
-    $script:LastBillingFallbackError = ''
-    try {
-        Set-Content -LiteralPath $propertiesPath -Value ('{"appId":"' + $ClientId + '"}') -Encoding utf8 -ErrorAction Stop
-        # These are the only two versions the resource type has, and each reaches a different service code path.
-        foreach ($apiVersion in '2023-04-13', '2022-09-22-preview') {
-            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result "Trying the generic ARM route on API version $apiVersion, which does not involve the preview extension."
-            $output = & az resource create --subscription $SubscriptionId --resource-group $ResourceGroup --name $ResourceName `
-                --resource-type 'Microsoft.GraphServices/accounts' --api-version $apiVersion --location global `
-                --properties "@$propertiesPath" --only-show-errors 2>&1
-            $commandSucceeded = ($LASTEXITCODE -eq 0)
-            if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
-                $result = if ($commandSucceeded) { 'succeeded' } else { 'returned an error after creating the resource' }
-                Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The generic ARM route $result on API version $apiVersion, and generic verification confirmed the billing link."
-                return $true
-            }
-            $script:LastBillingFallbackError = "Generic ARM API version ${apiVersion}: $(("$output" -replace '\s+', ' ').Trim())"
-            Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "API version $apiVersion was refused: $(("$output" -replace '\s+', ' ').Trim())"
-        }
-
-        $template = [ordered]@{
-            '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
-            contentVersion = '1.0.0.0'
-            resources = @([ordered]@{
-                    type = 'Microsoft.GraphServices/accounts'
-                    apiVersion = '2023-04-13'
-                    name = $ResourceName
-                    location = 'global'
-                    properties = [ordered]@{appId = $ClientId}
-                })
-        }
-        Set-Content -LiteralPath $templatePath -Value ($template | ConvertTo-Json -Depth 8) -Encoding utf8 -ErrorAction Stop
-        $deploymentName = 'purview-file-labeling-billing-' + [guid]::NewGuid().ToString('N').Substring(0, 16)
-        Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Trying an ARM template deployment, which uses Azure Resource Manager instead of the Graph Services extension.'
-        $output = & az deployment group create --subscription $SubscriptionId --resource-group $ResourceGroup --name $deploymentName `
-            --template-file $templatePath --only-show-errors 2>&1
-        $commandSucceeded = ($LASTEXITCODE -eq 0)
-        if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
-            $result = if ($commandSucceeded) { 'created' } else { 'returned an error after creating' }
-            Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The ARM template deployment $result the billing resource, and generic verification confirmed the link."
-            return $true
-        }
-        $script:LastBillingFallbackError = "ARM template deployment: $(("$output" -replace '\s+', ' ').Trim())"
-        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "The ARM template deployment was refused or could not be verified: $(($output -replace '\s+', ' ').Trim())"
-        return $false
-    }
-    finally {
-        Remove-Item -LiteralPath $propertiesPath -Force -ErrorAction SilentlyContinue
-        Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
-    }
+    return [pscustomobject]@{Ready = $true; FailureKind = 'None'; Message = "Global Azure, subscription $SubscriptionId, resource group '$ResourceGroup', Microsoft.GraphServices, application ownership, and subscription Contributor access are ready for the documented billing association command."}
 }
 
 function Invoke-AzureAction {
@@ -4066,6 +4020,34 @@ function Add-Signature { param($Set, [string]$Signature)
 function Import-AzResourcesModule {
     if ($script:AzResourcesVersion) { Import-Module Az.Resources -RequiredVersion $script:AzResourcesVersion -ErrorAction Stop }
     else { Import-Module Az.Resources -ErrorAction Stop }
+}
+function Get-Value { param($Object, [string]$Name)
+    if ($null -eq $Object) { return $null }
+    if ($Object -is [System.Collections.IDictionary]) { if ($Object.Contains($Name)) { return $Object[$Name] } return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+function Get-BillingResource { param([string]$ResourceGroup, [string]$ResourceName)
+    try {
+        $found = @(Get-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $ResourceGroup `
+                -Name $ResourceName -ExpandProperties -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if ($found.Count -eq 0) { return $null }
+        $resource = $found[0]
+        $properties = Get-Value $resource 'Properties'
+        $state = Get-Value $properties 'provisioningState'
+        if ([string]::IsNullOrWhiteSpace([string]$state)) { $state = Get-Value $resource 'ProvisioningState' }
+        return [ordered]@{
+            type = [string](Get-Value $resource 'ResourceType')
+            location = [string](Get-Value $resource 'Location')
+            properties = [ordered]@{
+                appId = [string](Get-Value $properties 'appId')
+                billingPlanId = [string](Get-Value $properties 'billingPlanId')
+                provisioningState = [string]$state
+            }
+        }
+    }
+    catch { return $null }
 }
 try {
     $arguments = if ([string]::IsNullOrWhiteSpace($ArgumentJson)) { @{} } else { ConvertFrom-Json $ArgumentJson -AsHashtable }
@@ -4129,7 +4111,8 @@ try {
         'BillingExists' {
             $null = Set-AzContext -Subscription $arguments['SubscriptionId'] -ErrorAction Stop
             Import-AzResourcesModule
-            $existing = Get-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $arguments['ResourceGroup'] -Name $arguments['ResourceName'] -ErrorAction SilentlyContinue
+            $existing = Get-BillingResource -ResourceGroup $arguments['ResourceGroup'] -ResourceName $arguments['ResourceName']
+            if ($existing) { $result.Value = @($existing) }
             $result.Status = if ($existing) { 'Present' } else { 'Missing' }
         }
         'BillingLink' {
@@ -4170,9 +4153,10 @@ try {
                 break
             }
 
-            function Test-Exists { try { return [bool](Get-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $resourceGroup -Name $resourceName -ErrorAction SilentlyContinue) } catch { return $false } }
+            function Get-Existing { return Get-BillingResource -ResourceGroup $resourceGroup -ResourceName $resourceName }
             'PROGRESS:Checking whether the billing resource already exists.'
-            if (Test-Exists) { $result.Status = 'Exists'; throw 'done' }
+            $existing = Get-Existing
+            if ($existing) { $result.Value = @($existing); $result.Status = 'Exists'; throw 'done' }
 
             # An unregistered namespace is simply absent, so absence is the signal to register.
             $registered = $false
@@ -4196,28 +4180,7 @@ try {
                 $result.Message = 'Microsoft.GraphServices did not report Registered after provider registration.'
                 break
             }
-            if (-not (Get-Command Test-AzResourceGroupDeployment -ErrorAction SilentlyContinue)) {
-                $result.Status = 'PreflightFailed'
-                $result.Message = 'Az.Resources does not provide Test-AzResourceGroupDeployment, so it cannot validate the billing deployment without creating it. Install or use the Azure CLI.'
-                break
-            }
-            $validationTemplate = @{
-                '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
-                contentVersion = '1.0.0.0'
-                resources = @(@{ type = 'Microsoft.GraphServices/accounts'; apiVersion = '2023-04-13'; name = $resourceName; location = 'global'; properties = @{appId = $clientId} })
-            }
-            try {
-                $null = Test-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -TemplateObject $validationTemplate -ErrorAction Stop
-            }
-            catch {
-                $result.Message = "Azure Resource Manager could not validate the billing resource deployment: $($_.Exception.Message)"
-                if ($result.Message -match '(?is)(TryCreateLogger|OpenTelemetry(?:\.Logs\.)?LoggerProviderSdk).*cannot\W*reduce\W*access') {
-                    $result.Status = 'ProviderFault'
-                }
-                else { $result.Status = 'PreflightFailed' }
-                break
-            }
-            $result.Message = 'Global Azure, subscription, resource group, Microsoft.GraphServices, and ARM deployment validation are ready.'
+            $result.Message = 'Global Azure, subscription, resource group, and Microsoft.GraphServices are ready.'
 
             $versions = @()
             try {
@@ -4281,7 +4244,9 @@ try {
                     else {
                         $null = New-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $resourceGroup -Name $resourceName -Location global -Properties @{ appId = $clientId } -ApiVersion $route.Api -Force -ErrorAction Stop
                     }
-                    $created = $true
+                    $existing = Get-Existing
+                    if ($existing) { $result.Value = @($existing); $created = $true }
+                    else { $last = 'The create request completed, but Azure did not return the billing resource during read-back.'; break }
                 }
                 catch {
                     $last = "$($_.Exception.Message)"
@@ -4290,12 +4255,19 @@ try {
                     $null = $kinds.Add([string]$route.Kind)
                     $null = $apis.Add([string]$route.Api)
                     foreach ($m in [regex]::Matches($last, '(?i)CorrelationId:\s*(?<id>[0-9a-f-]{36})')) { $null = $correlation.Add($m.Groups['id'].Value) }
-                    if (Test-Exists) { $created = $true; break }
+                    $existing = Get-Existing
+                    if ($existing) { $result.Value = @($existing); $created = $true; break }
 
                     $reason = ($last -replace '\s+', ' ').Trim()
                     if ($reason.Length -gt 220) { $reason = $reason.Substring(0, 220) + '...' }
                     "PROGRESS:That route was refused: $reason"
 
+                    if ($last -match '(?is)(TryCreateLogger|OpenTelemetry(?:\.Logs\.)?LoggerProviderSdk).*cannot\W*reduce\W*access') {
+                        $result.Status = 'ProviderFault'
+                        $result.Message = $last
+                        'PROGRESS:Microsoft.GraphServices returned its known provider implementation fault. No other create route will be attempted.'
+                        break
+                    }
                     # A .NET loader error is this process failing to load the Azure module, not Azure
                     # refusing the request. Every route uses that module, so retrying cannot help.
                     if ($last -match '(?i)cannot reduce access|typeload|could not load file or assembly|does not have an implementation|methodaccess|ambiguous match') {
@@ -4314,7 +4286,7 @@ try {
             $result.Correlation = @($correlation | Select-Object -Unique)
             $result.Signature = if ($signatures.Count -gt 0) { @($signatures)[0] } else { '' }
             if ($created) { $result.Status = 'Created' }
-            elseif ($result.Status -ne 'ClientFault') { $result.Status = 'Failed'; $result.Message = $last }
+            elseif ($result.Status -notin 'ClientFault', 'ProviderFault') { $result.Status = 'Failed'; $result.Message = $last }
         }
     }
 }
@@ -4486,7 +4458,9 @@ function Invoke-BillingLinkInCloudShell {
     $command = 'az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors; ' +
         "az account set --subscription $SubscriptionId; " +
         "az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --wait --only-show-errors; " +
-        "az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName --subscription $SubscriptionId --location global --app-id $ClientId"
+        "az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName --subscription $SubscriptionId --location global --app-id $ClientId; " +
+        "az resource list --resource-type Microsoft.GraphServices/accounts --subscription $SubscriptionId --output json --only-show-errors; " +
+        "az resource show --resource-group $ResourceGroup --name $ResourceName --resource-type Microsoft.GraphServices/accounts --subscription $SubscriptionId --output json --only-show-errors"
 
     $copied = $false
     try { Set-Clipboard -Value $command -ErrorAction Stop; $copied = $true }
@@ -4519,9 +4493,15 @@ function Invoke-BillingLinkInCloudShell {
             SubscriptionId = $SubscriptionId
             ResourceGroup = $ResourceGroup
             ResourceName = $ResourceName
+            ClientId = $ClientId
         }
         if ($check.Status -eq 'Present') {
-            Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' now exists, so application $ClientId is billed to subscription $SubscriptionId."
+            $state = Get-MeteredBillingResourceState -Resource (@($check.Value) | Select-Object -First 1) -ClientId $ClientId
+            if ($state.Status -ne 'Ready') {
+                Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Azure found the billing resource, but it does not satisfy the documented success response: $($state.Message)"
+                return $false
+            }
+            Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' satisfies the documented success response, so application $ClientId is billed to subscription $SubscriptionId."
             $script:LastBillingWasServiceFault = $false
             Clear-PendingBillingLink
             return $true
@@ -4535,10 +4515,10 @@ function Invoke-BillingLinkInCloudShell {
         Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "The link could not be confirmed from this machine: $([string]$check.Message)"
         $accept = Read-MenuChoice -Title 'Cloud Shell is the authority here. What did it report?' -Options ([ordered]@{
                 '1' = 'Nothing conclusive yet, let me check again (default)'
-                '2' = 'It printed the JSON result, so the resource was created'
+                '2' = "Show returned Global, appId $ClientId, a billingPlanId, and Succeeded"
             }) -Default '1'
         if ($accept -eq '2') {
-            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Accepted on the Cloud Shell result. The first label written to SharePoint confirms it for real.'
+            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Accepted on the complete documented Cloud Shell response: Global location, expected application ID, billing plan ID, and Succeeded provisioning state.'
             $script:LastBillingWasServiceFault = $false
             Clear-PendingBillingLink
             return $true
@@ -4590,7 +4570,7 @@ function Set-MeteredBillingLink {
             $providerOutput = & az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --wait --only-show-errors 2>&1
             if ($LASTEXITCODE -ne 0) { throw "az provider register failed: $(($providerOutput -join ' ').Trim())" }
             $preflight = Test-MeteredBillingPreflight -Tool $Tool -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
-                -ResourceName $ResourceName -ClientId $ClientId -TenantId $TenantId
+                -ClientId $ClientId -TenantId $TenantId
             if (-not $preflight.Ready) {
                 Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason $preflight.Message
                 $diagnostic = Get-AzureFailureDiagnostic -Message $preflight.Message
@@ -4612,6 +4592,12 @@ function Set-MeteredBillingLink {
             # The graph-services command group ships in the graphservices extension package.
             $extensionOutput = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
             if ($LASTEXITCODE -ne 0) { throw "az extension add failed: $(($extensionOutput -join ' ').Trim())" }
+            $extensionVersionOutput = & az extension show --name graphservices --query version --output tsv --only-show-errors 2>&1
+            $extensionVersion = if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$extensionVersionOutput")) {
+                "$extensionVersionOutput".Trim()
+            }
+            else { '<installed; version unavailable>' }
+            Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result "graphservices extension after installation=$extensionVersion."
             $output = & az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName `
                 --subscription $SubscriptionId --location global --app-id $ClientId 2>&1
             $created = $false
@@ -4626,12 +4612,10 @@ function Set-MeteredBillingLink {
                 $primaryError = (("$output" -replace '\s+', ' ').Trim())
                 if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
                     $created = $true
-                    Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result 'Azure returned an error after creating the resource, but generic ARM verification confirmed the billing link.'
+                    Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result 'Azure returned an error after creating the resource, but the documented list/show verification confirmed the billing link.'
                 }
                 else {
-                    $created = Set-MeteredBillingResourceDirect -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
-                        -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool
-                    if (-not $created) { throw "az graph-services account create failed: $primaryError Generic ARM fallbacks also failed: $($script:LastBillingFallbackError)" }
+                    throw "az graph-services account create failed: $primaryError"
                 }
             }
         }
@@ -4647,6 +4631,12 @@ function Set-MeteredBillingLink {
             }
             $script:LastBillingCorrelationIds = @(@($response.Correlation) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
             if ($response.Status -eq 'Exists') {
+                $state = Get-MeteredBillingResourceState -Resource (@($response.Value) | Select-Object -First 1) -ClientId $ClientId
+                if ($state.Status -ne 'Ready') {
+                    $script:LastBillingPreflightFailed = $true
+                    Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason $state.Message
+                    return $false
+                }
                 Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' already exists in $ResourceGroup, so nothing needed creating."
                 $script:LastBillingWasServiceFault = $false
                 $script:LastBillingWasProviderFault = $false
@@ -4662,7 +4652,7 @@ function Set-MeteredBillingLink {
                 $script:LastBillingWasProviderFault = $true
                 $script:LastBillingWasServiceFault = $true
                 $script:LastBillingFailureSignature = Get-FailureSignature -Message ([string]$response.Message)
-                Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason ([string]$response.Message)
+                Add-RunFailure -FilePath '' -Action 'Link metered billing' -Reason ([string]$response.Message)
                 return $false
             }
             if ($response.Status -eq 'ClientFault') {
@@ -4680,10 +4670,14 @@ function Set-MeteredBillingLink {
                         ClientId = $ClientId
                     }
                     if ($retry.Status -eq 'Created' -or $retry.Status -eq 'Exists') {
-                        Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Application $ClientId is now billed to subscription $SubscriptionId through resource '$ResourceName'."
-                        $script:LastBillingWasClientFault = $false
-                        Clear-PendingBillingLink
-                        return $true
+                        $retryState = Get-MeteredBillingResourceState -Resource (@($retry.Value) | Select-Object -First 1) -ClientId $ClientId
+                        if ($retryState.Status -eq 'Ready') {
+                            Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Application $ClientId is now billed to subscription $SubscriptionId through resource '$ResourceName'."
+                            $script:LastBillingWasClientFault = $false
+                            Clear-PendingBillingLink
+                            return $true
+                        }
+                        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "The resource still does not satisfy the documented success response: $($retryState.Message)"
                     }
                     Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "It still failed after the cleanup: $([string]$retry.Message)"
                 }
@@ -4701,6 +4695,8 @@ function Set-MeteredBillingLink {
                 return $false
             }
             if ($response.Status -ne 'Created') { throw ([string]$response.Message) }
+            $state = Get-MeteredBillingResourceState -Resource (@($response.Value) | Select-Object -First 1) -ClientId $ClientId
+            if ($state.Status -ne 'Ready') { throw "Az PowerShell created a resource that does not satisfy the documented success response: $($state.Message)" }
         }
         Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Application $ClientId is now billed to subscription $SubscriptionId through resource '$ResourceName'."
         $script:LastBillingWasServiceFault = $false
@@ -4727,8 +4723,8 @@ function Set-MeteredBillingLink {
         if ($script:LastBillingWasProviderFault) {
             Write-Host ''
             Write-Host '  Microsoft.GraphServices returned an OpenTelemetry type-load failure.' -ForegroundColor Yellow
-            Write-Host '  That is a provider implementation error; retrying from this machine or Cloud' -ForegroundColor Gray
-            Write-Host '  Shell cannot change the provider assemblies. The pending link is retained, but' -ForegroundColor Gray
+            Write-Host '  That is a provider implementation error. No alternative create route was sent,' -ForegroundColor Gray
+            Write-Host '  because it would reach the same provider. The pending link is retained, but' -ForegroundColor Gray
             Write-Host '  startup will not retry this exact failure automatically.' -ForegroundColor Gray
         }
         elseif ($script:LastBillingWasServiceFault) {
@@ -4908,6 +4904,15 @@ function Invoke-MeteredSetup {
     }
 
     if (Read-MeteredBillingSetting -ClientId $application.ClientId -TenantId $application.TenantId) { return 'Main' }
+
+    if ($script:LastBillingWasProviderFault) {
+        Write-Host ''
+        Write-Host '  The application and certificate are being kept because Microsoft.GraphServices,' -ForegroundColor Yellow
+        Write-Host '  not this registration, failed the documented billing command. Registering another' -ForegroundColor Yellow
+        Write-Host '  application would repeat the same provider failure. The exact pending link is saved.' -ForegroundColor Yellow
+        Write-RunLog -Severity WARN -Action 'Keep confidential client' -Result "Application $($application.ClientId), its certificate, and the pending billing link were retained after the Microsoft.GraphServices provider fault. No rollback or re-registration is needed."
+        return 'Main'
+    }
 
     # A confidential client without a billing link cannot write anything, so leaving it behind only accumulates clutter.
     Write-Host ''
@@ -5246,8 +5251,8 @@ function Wait-ForBillingLink {
     # later attempt through the same code returns the same answer.
     Write-Host ''
     if ($script:LastBillingWasProviderFault) {
-        Write-Host '  Microsoft.GraphServices failed its own validation endpoint while loading its' -ForegroundColor Yellow
-        Write-Host '  OpenTelemetry assemblies. No create command was sent, and this is not a problem' -ForegroundColor Yellow
+        Write-Host '  The documented create command reached Microsoft.GraphServices, which failed while' -ForegroundColor Yellow
+        Write-Host '  loading its OpenTelemetry assemblies. This is not a problem' -ForegroundColor Yellow
         Write-Host '  with your subscription, tenant, resource group, or authorization.' -ForegroundColor Yellow
         Write-Host ''
         Write-Host '  The exact billing link is saved, but startup will not retry this provider fault.' -ForegroundColor Gray
@@ -5258,6 +5263,10 @@ function Wait-ForBillingLink {
     if ($script:LastBillingWasClientFault) {
         Write-Host '  The Azure module could not load in its own process on this machine, so the request' -ForegroundColor Yellow
         Write-Host '  never reached Azure at all. Retrying it here would fail the same way.' -ForegroundColor Yellow
+    }
+    elseif ($Tool.Kind -eq 'AzureCli') {
+        Write-Host '  The documented Azure CLI create command was refused, and read-only list/show' -ForegroundColor Yellow
+        Write-Host '  verification found no completed billing link. No alternate create route was sent.' -ForegroundColor Yellow
     }
     else {
         Write-Host '  Every route this utility has was refused: the Az cmdlet, a direct request, and a' -ForegroundColor Yellow
