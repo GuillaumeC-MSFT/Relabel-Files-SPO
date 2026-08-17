@@ -39,8 +39,8 @@ $script:LogPath = ''
 $script:LogBuffer = [System.Collections.Generic.List[string]]::new()
 # Only an application this run registered may ever be cleaned up.
 $script:CreatedApplication = $null
-# Set only when the operator asks for the relabeling utility to run once provisioning finishes.
-$script:LaunchRelabelPath = ''
+# Set only when the operator asks for the labeling utility to run once provisioning finishes.
+$script:LaunchLabelingPath = ''
 
 # Folders are created in order, so each parent exists before its child.
 $script:FolderTree = @(
@@ -1679,8 +1679,8 @@ function Read-SignInRecovery {
     }
 }
 
-function Save-RelabelHandoff {
-    <# .SYNOPSIS Remembers the created site and library so the relabeling utility can propose them without typing. #>
+function Save-LabelingHandoff {
+    <# .SYNOPSIS Remembers the created site and library so the labeling utility can propose them without typing. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SiteUrl,
@@ -1690,13 +1690,13 @@ function Save-RelabelHandoff {
     )
 
     $values = [ordered]@{
-        RELABEL_FILES_SITE_URL = $SiteUrl
-        RELABEL_FILES_LIBRARY = $LibraryTitle
+        PURVIEW_FILE_LABELING_SITE_URL = $SiteUrl
+        PURVIEW_FILE_LABELING_LIBRARY = $LibraryTitle
     }
-    # Relabel-Files.ps1 looks the application up per tenant, so the name has to match the form it reads.
+    # Invoke-PurviewFileLabeling.ps1 looks the application up per tenant, so the name has to match the form it reads.
     $parsedTenant = [guid]::Empty
     if (-not [string]::IsNullOrWhiteSpace($ClientId) -and [guid]::TryParse($TenantId, [ref]$parsedTenant) -and $parsedTenant -ne [guid]::Empty) {
-        $values['RELABEL_FILES_CLIENT_ID_' + $parsedTenant.ToString('N').ToUpperInvariant()] = $ClientId
+        $values['PURVIEW_FILE_LABELING_CLIENT_ID_' + $parsedTenant.ToString('N').ToUpperInvariant()] = $ClientId
     }
     foreach ($name in $values.Keys) {
         [Environment]::SetEnvironmentVariable($name, $values[$name], [EnvironmentVariableTarget]::Process)
@@ -1704,10 +1704,10 @@ function Save-RelabelHandoff {
         catch { Write-Step -Severity Warn -Message "Could not persist ${name}: $($_.Exception.Message)" }
     }
     if ($values.Count -gt 2) {
-        Write-Step -Message 'Remembered this site, library, and application, so Relabel-Files.ps1 can reuse the same sign-in instead of registering its own.'
+        Write-Step -Message 'Remembered this site, library, and application, so Invoke-PurviewFileLabeling.ps1 can reuse the same sign-in instead of registering its own.'
     }
     else {
-        Write-Step -Message 'Remembered this site and library, so Relabel-Files.ps1 offers them as defaults.'
+        Write-Step -Message 'Remembered this site and library, so Invoke-PurviewFileLabeling.ps1 offers them as defaults.'
     }
 }
 
@@ -1847,7 +1847,7 @@ if (-not $NoRelaunch -and $PSVersionTable.PSVersion -lt [version]'7.2.0') {
 Write-Host ''
 Write-Host '  SharePoint Online label test-data provisioner' -ForegroundColor Cyan
 Write-Host '  Creates a new site, a document library, nested folders, and labelable files.' -ForegroundColor Gray
-Write-Host '  This helper is optional and only for validation. It is not required for normal relabeling.' -ForegroundColor Gray
+Write-Host '  This helper is optional and only for validation. It is not required for normal file labeling.' -ForegroundColor Gray
 Write-Host ''
 
 $defaultLogFolder = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) { $PSScriptRoot } else { (Get-Location).Path }
@@ -2094,37 +2094,37 @@ try {
     Write-Step -Severity Good -Message "Folders   : $($script:FolderTree.Count) (4 levels deep)"
     Write-Step -Severity Good -Message "Files     : $uploadedCount (.docx and .xlsx)"
     Write-Host ''
-    Write-Step -Message 'Every file starts with no sensitivity label, so a first relabelling run reports them all as changeable. To exercise the rule that protects an existing higher label, label a few files by hand and run it again.'
+    Write-Step -Message 'Every file starts with no sensitivity label, so a first labeling run reports them all as changeable. To exercise the rule that protects an existing higher label, label a few files by hand and run it again.'
     Write-Host ''
     # Handing the application over only helps when it still exists after this run has cleaned up.
     $applicationSurvives = ($null -eq $script:CreatedApplication) -or $KeepApp
     $handoffClientId = if ($applicationSurvives) { $clientId } else { '' }
-    Save-RelabelHandoff -SiteUrl $siteUrl -LibraryTitle $script:LibraryTitle -ClientId $handoffClientId -TenantId $tenantMetadata.TenantId
+    Save-LabelingHandoff -SiteUrl $siteUrl -LibraryTitle $script:LibraryTitle -ClientId $handoffClientId -TenantId $tenantMetadata.TenantId
 
-    $relabelScript = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { '' } else { Join-Path $PSScriptRoot 'Relabel-Files.ps1' }
-    if (-not [string]::IsNullOrWhiteSpace($relabelScript) -and (Test-Path -LiteralPath $relabelScript -PathType Leaf)) {
-        Write-Step -Message "Relabel-Files.ps1 is in this folder and can start against the new library straight away."
+    $labelingScript = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) { '' } else { Join-Path $PSScriptRoot 'Invoke-PurviewFileLabeling.ps1' }
+    if (-not [string]::IsNullOrWhiteSpace($labelingScript) -and (Test-Path -LiteralPath $labelingScript -PathType Leaf)) {
+        Write-Step -Message "Invoke-PurviewFileLabeling.ps1 is in this folder and can start against the new library straight away."
         if ($AcceptDefaults -or -not (Test-InteractiveHost)) {
-            Write-Step -Message 'Running unattended, so it was not started. Run it yourself to relabel this library.'
+            Write-Step -Message 'Running unattended, so it was not started. Run it yourself to label this library.'
         }
         else {
-            $answer = ([string](Read-Host '  Start Relabel-Files.ps1 against this library now? [Y/n]')).Trim()
+            $answer = ([string](Read-Host '  Start Invoke-PurviewFileLabeling.ps1 against this library now? [Y/n]')).Trim()
             if ([string]::IsNullOrWhiteSpace($answer) -or $answer -match '^(?i)y(es)?$') {
                 # Deferred to the end of the script so the Entra cleanup in the finally block runs first.
-                $script:LaunchRelabelPath = $relabelScript
+                $script:LaunchLabelingPath = $labelingScript
                 Write-Step -Message 'It will start once this run has cleaned up its own application.'
             }
         }
     }
     else {
-        Write-Step -Message 'To relabel this library with Relabel-Files.ps1, choose the SharePoint Online source and supply:'
+        Write-Step -Message 'To label this library with Invoke-PurviewFileLabeling.ps1, choose the SharePoint Online source and supply:'
         Write-Step -Message "  Site URL : $siteUrl"
         Write-Step -Message "  Library  : $script:LibraryTitle"
     }
     if (-not $applicationSurvives) {
         Write-Step -Message 'That script registers its own application, because the one created here is SharePoint-only and is removed when this run ends. Add -KeepApp to hand this one over instead and save a sign-in.'
     }
-    Write-Step -Message 'To relabel with the local/UNC/SharePoint Server file path source instead, sync this library with the OneDrive client and point the script at the local synced folder.'
+    Write-Step -Message 'To label through the local/UNC/SharePoint Server file path source instead, sync this library with the OneDrive client and point the script at the local synced folder.'
     Write-Host ''
 }
 catch {
@@ -2145,14 +2145,14 @@ finally {
 }
 
 # Started here, not inside the try block, so the Entra cleanup above has already finished.
-if (-not [string]::IsNullOrWhiteSpace($script:LaunchRelabelPath)) {
-    Write-Banner -Title 'Starting Relabel-Files.ps1 against the new library' -Body @(
+if (-not [string]::IsNullOrWhiteSpace($script:LaunchLabelingPath)) {
+    Write-Banner -Title 'Starting Invoke-PurviewFileLabeling.ps1 against the new library' -Body @(
         'The site and library are already remembered, so press Enter at',
         'those prompts to accept them.'
     )
     Write-Host ''
     # The source is already known, so it is carried over rather than asked again.
-    $relabelArguments = @('-InitialSource', 'SharePoint')
-    if ($AuthMode -eq 'DeviceCode') { $relabelArguments += '-DeviceLogin' }
-    & $script:LaunchRelabelPath @relabelArguments
+    $labelingArguments = @('-InitialSource', 'SharePoint')
+    if ($AuthMode -eq 'DeviceCode') { $labelingArguments += '-DeviceLogin' }
+    & $script:LaunchLabelingPath @labelingArguments
 }

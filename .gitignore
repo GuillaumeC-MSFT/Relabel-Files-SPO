@@ -1,7 +1,7 @@
 # Run artifacts record site URLs, tenant IDs, folder paths, and account names,
 # and both scripts default to writing them next to themselves, which is this repo.
-Relabel-Files-*.log
-Relabel-Files-*.csv
+Invoke-PurviewFileLabeling-*.log
+Invoke-PurviewFileLabeling-*.csv
 New-LabelTestSite-*.log
 LabelTestSiteCleanup-*.json
 

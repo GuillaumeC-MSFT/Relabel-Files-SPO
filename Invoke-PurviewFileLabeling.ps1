@@ -70,7 +70,11 @@ $script:IgnoreRemembered = [bool]$Fresh
 $script:ConnectedAppOnly = $false
 $script:LastBillingCorrelationIds = @()
 $script:LastBillingWasServiceFault = $false
+$script:LastBillingWasProviderFault = $false
 $script:LastBillingFailureSignature = ''
+$script:LastBillingPreflightFailed = $false
+$script:LastBillingResourceStatus = $null
+$script:LastBillingFallbackError = ''
 # Every certificate this run generates is tracked, so nothing it created outlives its use.
 $script:CreatedCertificateThumbprints = [System.Collections.Generic.List[string]]::new()
 # Windows PowerShell writes a BOM for 'utf8' and PowerShell 7 does not, yet Excel needs one to read non-ASCII paths correctly.
@@ -252,6 +256,14 @@ function Test-AzureServiceFailure {
     return $Message -match '(?i)internalservererror|internal server error|\b(500|502|503|504)\b|servicebusy|service unavailable|gatewaytimeout|temporarily unavailable|please retry|try again later'
 }
 
+function Test-AzureProviderImplementationFailure {
+    <# .SYNOPSIS Identifies the Microsoft.GraphServices OpenTelemetry type-load error that request retries cannot repair. #>
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Message)
+
+    return ($Message -match '(?is)TryCreateLogger.*cannot reduce access|OpenTelemetry\.Logs\.LoggerProviderSdk.*cannot reduce access')
+}
+
 function Get-FailureSignature {
     <# .SYNOPSIS Reduces an error to a comparable form, because one fault reported twice differs in correlation ID and escaping. #>
     [CmdletBinding()]
@@ -296,8 +308,8 @@ function Initialize-RunArtifact {
             }
         }
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $script:LogPath = Join-Path $Folder "Relabel-Files-$stamp.log"
-        $script:ReportPath = Join-Path $Folder "Relabel-Files-$stamp.csv"
+        $script:LogPath = Join-Path $Folder "Invoke-PurviewFileLabeling-$stamp.log"
+        $script:ReportPath = Join-Path $Folder "Invoke-PurviewFileLabeling-$stamp.csv"
         if ($PSCmdlet.ShouldProcess($script:LogPath, 'Create log file')) {
             $null = New-Item -ItemType File -Path $script:LogPath -Force -ErrorAction Stop
         }
@@ -517,7 +529,7 @@ function Install-PurviewClient {
 
     Write-Host ''
     Write-Host '  The Purview Information Protection client is what writes a label to a file. It' -ForegroundColor Gray
-    Write-Host '  needs no Azure subscription, no billing link, and no metered API, so labelling' -ForegroundColor Gray
+    Write-Host '  needs no Azure subscription, no billing link, and no metered API, so labeling' -ForegroundColor Gray
     Write-Host '  local files and OneDrive-synced libraries costs nothing per file.' -ForegroundColor Gray
     $choice = Read-MenuChoice -Title 'Install it now?' -Options ([ordered]@{
             '1' = 'Yes, install it with winget (default)'
@@ -902,7 +914,7 @@ function Connect-SharePointSite {
                 Write-Host '  Opening a browser to sign in. This waits here until you finish there,' -ForegroundColor Cyan
                 Write-Host '  so check for a window behind this one if nothing seems to happen.' -ForegroundColor Cyan
                 Write-Host '  If it never appears, or only offers a passkey you cannot use, press' -ForegroundColor Gray
-                Write-Host '  Ctrl+C and start again with:  .\Relabel-Files.ps1 -DeviceLogin' -ForegroundColor Gray
+                Write-Host '  Ctrl+C and start again with:  .\Invoke-PurviewFileLabeling.ps1 -DeviceLogin' -ForegroundColor Gray
             }
             # A cached token also caches the credential choice, so a fresh prompt is the only way back to the account picker.
             if ($script:ForceFreshSignIn) { $parameters.ForceAuthentication = $true }
@@ -926,7 +938,7 @@ function Connect-SharePointSite {
             }
             Add-RunFailure -FilePath $SiteUrl -Action 'Connect SharePoint site' -Reason $message
             if ($isMissingApplication) {
-                Block-RelabelClientId -ClientId $ClientId -TenantId $TenantId
+                Block-LabelingClientId -ClientId $ClientId -TenantId $TenantId
                 Write-RunLog -Severity INFO -Action 'SharePoint sign-in guidance' -Result "Application $ClientId does not exist in tenant $TenantId. It was most likely registered in a different tenant, so register a new one at the next prompt."
             }
             elseif ($isWrongTenantAccount) {
@@ -1361,13 +1373,13 @@ function Invoke-FileProcessing {
                     Set-OneFileLabel -Path $file.FullName -LabelId ([guid]$TargetLabel.Id) -Confirm:$false
                 }
                 $outcome = switch ([string]$result.Status) {
-                    'Success' { 'Labelled' }
+                    'Success' { 'Labeled' }
                     'Unconfirmed' { 'Unconfirmed' }
                     default { 'Skipped' }
                 }
                 $details = [string]$result.Comment
                 Add-FileResult -FilePath $file.FullName -PreviousLabel $previousName -NewLabel $TargetLabel.Name -Outcome $outcome -Details $details
-                $severity = if ($outcome -eq 'Labelled') { 'SUCCESS' } else { 'WARN' }
+                $severity = if ($outcome -eq 'Labeled') { 'SUCCESS' } else { 'WARN' }
                 Write-RunLog -Severity $severity -FilePath $file.FullName -Action 'Apply label' -Result "$outcome. $details"
             }
             catch {
@@ -1432,17 +1444,18 @@ function Show-RunSummary {
     [CmdletBinding()]
     param()
 
-    $labelled = @($script:Results | Where-Object Outcome -eq 'Labelled').Count
+    $labeled = @($script:Results | Where-Object Outcome -eq 'Labeled').Count
     $unconfirmed = @($script:Results | Where-Object Outcome -eq 'Unconfirmed').Count
     $skipped = @($script:Results | Where-Object Outcome -in 'Skipped', 'DryRun').Count
     $failed = @($script:Results | Where-Object Outcome -eq 'Failed').Count
     $elapsed = (Get-Date) - $script:RunStarted
-    $summary = 'Total scanned: {0}; labelled: {1}; unconfirmed: {2}; skipped/dry-run: {3}; failed: {4}; tracked failures: {5}; elapsed: {6:hh\:mm\:ss}' -f `
-        $script:Results.Count, $labelled, $unconfirmed, $skipped, $failed, $script:Failures.Count, $elapsed
+    $summary = 'Total scanned: {0}; labeled: {1}; unconfirmed: {2}; skipped/dry-run: {3}; failed: {4}; tracked failures: {5}; elapsed: {6:hh\:mm\:ss}' -f `
+        $script:Results.Count, $labeled, $unconfirmed, $skipped, $failed, $script:Failures.Count, $elapsed
     Write-RunLog -Severity INFO -Action 'Closing summary' -Result $summary -NoConsole
     Write-Host ''
     Write-Host "  Session summary  (utility $script:UtilityVersion)" -ForegroundColor Cyan
-    Write-Host "    Files scanned    : $($script:Results.Count)"    Write-Host "    Labelled         : $labelled"
+    Write-Host "    Files scanned    : $($script:Results.Count)"
+    Write-Host "    Labeled          : $labeled"
     Write-Host "    Not confirmed    : $unconfirmed" -ForegroundColor $(if ($unconfirmed -gt 0) { 'Yellow' } else { 'Gray' })
     Write-Host "    Skipped/dry-run  : $skipped"
     Write-Host "    Failed           : $failed" -ForegroundColor $(if ($failed -gt 0) { 'Red' } else { 'Gray' })
@@ -1453,7 +1466,7 @@ function Show-RunSummary {
         Write-Host ''
         Write-Host '  Files counted as not confirmed were accepted by Microsoft Graph but do not' -ForegroundColor Yellow
         Write-Host '  report the label yet. assignSensitivityLabel is asynchronous, so re-scanning' -ForegroundColor Yellow
-        Write-Host '  shortly may show them labelled. If they never change, confirm that a' -ForegroundColor Yellow
+        Write-Host '  shortly may show them labeled. If they never change, confirm that a' -ForegroundColor Yellow
         Write-Host '  confidential client is configured and that its Azure billing link exists.' -ForegroundColor Yellow
     }
 }
@@ -1554,7 +1567,7 @@ function Get-TenantScopedClientIdName {
 
     $parsed = [guid]::Empty
     if (-not [guid]::TryParse($TenantId, [ref]$parsed) -or $parsed -eq [guid]::Empty) { return '' }
-    return 'RELABEL_FILES_CLIENT_ID_' + $parsed.ToString('N').ToUpperInvariant()
+    return 'PURVIEW_FILE_LABELING_CLIENT_ID_' + $parsed.ToString('N').ToUpperInvariant()
 }
 
 function Get-ConfiguredClientId {
@@ -1567,7 +1580,7 @@ function Get-ConfiguredClientId {
     $names = [System.Collections.Generic.List[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($tenantScopedName)) { $names.Add($tenantScopedName) }
     # The legacy and third-party variables are tenant-agnostic, so they are offered only as unverified fallbacks.
-    foreach ($name in 'RELABEL_FILES_CLIENT_ID', 'ENTRAID_APP_ID', 'ENTRAID_CLIENT_ID', 'AZURE_CLIENT_ID') { $names.Add($name) }
+    foreach ($name in 'PURVIEW_FILE_LABELING_CLIENT_ID', 'ENTRAID_APP_ID', 'ENTRAID_CLIENT_ID', 'AZURE_CLIENT_ID') { $names.Add($name) }
 
     foreach ($variableName in $names) {
         foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTarget]::User) {
@@ -1704,7 +1717,7 @@ function Test-SharePointSourceAvailable {
     Write-RunLog -Severity WARN -Action 'Select source' -Result "The SharePoint Online source needs PnP.PowerShell, which requires PowerShell 7.2 or later. This host is Windows PowerShell $HostVersion."
     if (-not $NoRelaunch -and (Restart-InPowerShell7 -Source 'SharePoint')) { return $false }
 
-    $command = if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) { 'pwsh -File .\Relabel-Files.ps1' } else { "pwsh -File `"$($script:ScriptPath)`"" }
+    $command = if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) { 'pwsh -File .\Invoke-PurviewFileLabeling.ps1' } else { "pwsh -File `"$($script:ScriptPath)`"" }
     Write-RunLog -Severity INFO -Action 'Select source' -Result "To use it later, run: $command"
     Write-RunLog -Severity INFO -Action 'Select source' -Result 'The local/on-prem file path source works in this host with the Purview Information Protection client.'
     return $false
@@ -1785,7 +1798,7 @@ function Get-SharePointTenantId {
     return $tenantId.ToString()
 }
 
-function Save-RelabelClientId {
+function Save-LabelingClientId {
     <# .SYNOPSIS Remembers a non-secret application ID against the tenant it belongs to. #>
     [CmdletBinding()]
     param(
@@ -1809,7 +1822,7 @@ function Save-RelabelClientId {
     }
 }
 
-function Block-RelabelClientId {
+function Block-LabelingClientId {
     <# .SYNOPSIS Stops proposing an application ID the tenant does not recognise. #>
     [CmdletBinding()]
     param(
@@ -1826,7 +1839,7 @@ function Block-RelabelClientId {
         return
     }
     $ownedNames = [System.Collections.Generic.List[string]]::new()
-    $ownedNames.Add('RELABEL_FILES_CLIENT_ID')
+    $ownedNames.Add('PURVIEW_FILE_LABELING_CLIENT_ID')
     $tenantScopedName = Get-TenantScopedClientIdName -TenantId $TenantId
     if (-not [string]::IsNullOrWhiteSpace($tenantScopedName)) { $ownedNames.Add($tenantScopedName) }
 
@@ -1915,7 +1928,7 @@ function Invoke-GraphAction {
         return [pscustomobject]@{Status = 'Error'; Message = 'PowerShell 7 is needed to talk to Microsoft Graph separately from PnP.'; Value = ''}
     }
 
-    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelGraph-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('PurviewFileLabelingGraph-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $worker = @'
 param([string]$TenantId, [string]$Action, [string]$ArgumentJson, [string]$ScopeList, [switch]$NoPrompt, [switch]$UseDeviceCode)
 $ErrorActionPreference = 'Stop'
@@ -2091,7 +2104,7 @@ catch {
     finally { Remove-Item -LiteralPath $workerPath -Force -ErrorAction SilentlyContinue }
 }
 
-function New-RelabelApplicationViaGraph {
+function New-LabelingApplicationViaGraph {
     <# .SYNOPSIS Creates the read-only sign-in application through Graph, which is visible and cannot stall on a hidden window. #>
     [CmdletBinding()]
     param(
@@ -2129,13 +2142,13 @@ function Show-RegistrationSignInNotice {
     Write-Host ''
 }
 
-function New-RelabelApplication {
+function New-LabelingApplication {
     <# .SYNOPSIS Registers an Entra application carrying exactly the permissions this utility needs. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SiteUrl,
         [AllowEmptyString()][string]$TenantId = '',
-        [string]$ApplicationName = 'PnP PowerShell - Purview Relabeling'
+        [string]$ApplicationName = 'PnP PowerShell - Purview File Labeling'
     )
 
     try {
@@ -2148,9 +2161,9 @@ function New-RelabelApplication {
         Write-RunLog -Severity INFO -Action 'Register application' -Result 'Sign in as an account allowed to create app registrations. Both permissions are user-consentable, so an administrator is only needed if tenant policy restricts user consent.'
 
         # Graph is tried first because it reports progress here, rather than waiting on a window this utility cannot see.
-        $graphClientId = New-RelabelApplicationViaGraph -TenantId $tenantId -ApplicationName $ApplicationName
+        $graphClientId = New-LabelingApplicationViaGraph -TenantId $tenantId -ApplicationName $ApplicationName
         if (-not [string]::IsNullOrWhiteSpace($graphClientId)) {
-            Save-RelabelClientId -ClientId $graphClientId -TenantId $tenantId
+            Save-LabelingClientId -ClientId $graphClientId -TenantId $tenantId
             return $graphClientId
         }
 
@@ -2187,13 +2200,13 @@ function New-RelabelApplication {
                 $reusableId = Resolve-ExistingApplicationId -DisplayName $registrationName
                 if (-not [string]::IsNullOrWhiteSpace($reusableId)) {
                     Write-RunLog -Severity SUCCESS -Action 'Register application' -Result "Reusing the existing application '$registrationName', $reusableId."
-                    Save-RelabelClientId -ClientId $reusableId -TenantId $tenantId
+                    Save-LabelingClientId -ClientId $reusableId -TenantId $tenantId
                     return $reusableId
                 }
                 $decision = Read-DuplicateApplicationChoice -DisplayName $registrationName
                 if ($null -eq $decision) { throw "Registration stopped because '$registrationName' already exists in tenant $tenantId." }
                 if ($decision.Action -eq 'Existing') {
-                    Save-RelabelClientId -ClientId $decision.Value -TenantId $tenantId
+                    Save-LabelingClientId -ClientId $decision.Value -TenantId $tenantId
                     return $decision.Value
                 }
                 $registrationName = $decision.Value
@@ -2207,7 +2220,7 @@ function New-RelabelApplication {
                 $value = Get-ObjectPropertyValue -InputObject $item -Names @($propertyName)
                 if (-not [string]::IsNullOrWhiteSpace($value)) {
                     Write-RunLog -Severity SUCCESS -Action 'Register application' -Result "Registered application $value. Remove it in the Entra admin center when this utility is no longer needed."
-                    Save-RelabelClientId -ClientId $value -TenantId $tenantId
+                    Save-LabelingClientId -ClientId $value -TenantId $tenantId
                     return $value
                 }
             }
@@ -2215,7 +2228,7 @@ function New-RelabelApplication {
         $guidMatch = [regex]::Match([string]$output, '(?i)(?<![0-9a-f])[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}(?![0-9a-f])')
         if ($guidMatch.Success) {
             Write-RunLog -Severity SUCCESS -Action 'Register application' -Result "Registered application $($guidMatch.Value). Remove it in the Entra admin center when this utility is no longer needed."
-            Save-RelabelClientId -ClientId $guidMatch.Value -TenantId $tenantId
+            Save-LabelingClientId -ClientId $guidMatch.Value -TenantId $tenantId
             return $guidMatch.Value
         }
         throw 'Registration completed but did not return a recognizable application client ID.'
@@ -2316,12 +2329,12 @@ function Read-SharePointApplication {
                 elseif ($directory -eq 'Missing' -or -not $script:SessionSavedClientIds.Contains($saved.ClientId)) {
                     $evidence = if ($directory -eq 'Missing') { 'The directory confirms it does not exist' } else { 'Tenant {0} does not recognise it' -f $TenantId }
                     Write-RunLog -Severity WARN -Action 'Check application' -Result "$evidence, so application $($saved.ClientId) was forgotten and will not be proposed again."
-                    Block-RelabelClientId -ClientId $saved.ClientId -TenantId $TenantId
+                    Block-LabelingClientId -ClientId $saved.ClientId -TenantId $TenantId
                     continue
                 }
                 else {
                     Write-RunLog -Severity WARN -Action 'Check application' -Result "Application $($saved.ClientId) was registered moments ago and is not visible yet, so it was kept but is not offered this time."
-                    Block-RelabelClientId -ClientId $saved.ClientId -TenantId $TenantId -SessionOnly
+                    Block-LabelingClientId -ClientId $saved.ClientId -TenantId $TenantId -SessionOnly
                     continue
                 }
             }
@@ -2353,11 +2366,11 @@ function Read-SharePointApplication {
             return [pscustomobject]@{ClientId = $saved.ClientId; JustRegistered = $false}
         }
         if ($choice -like 'Forget *') {
-            Block-RelabelClientId -ClientId $saved.ClientId -TenantId $TenantId
+            Block-LabelingClientId -ClientId $saved.ClientId -TenantId $TenantId
             continue
         }
         if ($choice -eq 'Register a new application for this tenant') {
-            $newClientId = New-RelabelApplication -SiteUrl $SiteUrl -TenantId $TenantId
+            $newClientId = New-LabelingApplication -SiteUrl $SiteUrl -TenantId $TenantId
             if (-not [string]::IsNullOrWhiteSpace($newClientId)) {
                 return [pscustomobject]@{ClientId = $newClientId; JustRegistered = $true}
             }
@@ -2383,7 +2396,7 @@ function Read-SharePointTarget {
     while ($true) {
         Write-Host ''
         Write-Host '  Type back at any prompt below to return to the main menu.' -ForegroundColor DarkGray
-        $siteUrl = Read-ValueWithDefault -Prompt 'Site URL (for example https://contoso.sharepoint.com/sites/LabelTest)' -Default (Get-RememberedValue -Name 'RELABEL_FILES_SITE_URL')
+        $siteUrl = Read-ValueWithDefault -Prompt 'Site URL (for example https://contoso.sharepoint.com/sites/LabelTest)' -Default (Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_SITE_URL')
         if ($siteUrl -eq 'back') { return $null }
         if ($siteUrl -notmatch '^https://[^/]+\.') {
             Write-RunLog -Severity WARN -Action 'Validate site URL' -Result 'Enter the full site URL, starting with https://, or type back to return to the main menu.'
@@ -2401,7 +2414,7 @@ function Read-SharePointTarget {
         }
         Write-RunLog -Severity INFO -Action 'Resolve tenant' -Result "SharePoint reports tenant $tenantId for $siteUrl."
         # The URL answered a real SharePoint tenant challenge, so it is worth proposing again even if sign-in later fails.
-        Save-RememberedValue -Name 'RELABEL_FILES_SITE_URL' -Value $siteUrl
+        Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_SITE_URL' -Value $siteUrl
 
         # Sign-in retries stay on this site, so a failed attempt never re-asks for the URL.
         $connected = $false
@@ -2417,7 +2430,7 @@ function Read-SharePointTarget {
                         '1' = 'Yes, sign in as an administrator and grant it from here'
                         '2' = 'No, continue read-only for this run'
                     }) -Default '1'
-                if ($consentChoice -eq '1' -and (Grant-RelabelAdminConsent -ClientId $confidential.ClientId -TenantId $tenantId -Confirm:$false)) {
+                if ($consentChoice -eq '1' -and (Grant-LabelingAdminConsent -ClientId $confidential.ClientId -TenantId $tenantId -Confirm:$false)) {
                     Write-RunLog -Severity INFO -Action 'Check confidential client' -Result 'Consent granted. Waiting a few seconds for it to replicate before signing in.'
                     Start-Sleep -Seconds 10
                 }
@@ -2472,14 +2485,14 @@ function Read-SharePointTarget {
             $library = $libraries[$index]
             $libraryOptions[[string]($index + 1)] = '{0}  ({1} items, /{2})' -f $library.Title, $library.ItemCount, $library.SiteRelativeUrl
         }
-        $rememberedLibrary = Get-RememberedValue -Name 'RELABEL_FILES_LIBRARY'
+        $rememberedLibrary = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_LIBRARY'
         $libraryDefault = '1'
         for ($index = 0; $index -lt $libraries.Count; $index++) {
             if ($libraries[$index].Title -eq $rememberedLibrary) { $libraryDefault = [string]($index + 1); break }
         }
         $libraryChoice = Read-MenuChoice -Title 'Choose the document library to scan.' -Options $libraryOptions -Default $libraryDefault
         $selectedLibrary = $libraries[[int]$libraryChoice - 1]
-        Save-RememberedValue -Name 'RELABEL_FILES_LIBRARY' -Value $selectedLibrary.Title
+        Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_LIBRARY' -Value $selectedLibrary.Title
 
         $subfolder = ''
         if (-not $SkipSubfolder) {
@@ -2633,13 +2646,13 @@ function Read-LocalFolder {
     $synced = @(Get-SyncedLibraryFolder)
     if ($synced.Count -eq 0) {
         Write-Host ''
-        Write-Host '  Type the folder that holds the files to relabel, for example' -ForegroundColor Gray
+        Write-Host '  Type the folder that holds the files to label, for example' -ForegroundColor Gray
         Write-Host '  C:\Data\Contracts or \\fileserver\Finance\Reports.' -ForegroundColor Gray
         return Read-ValueWithDefault -Prompt 'Folder to scan' -Default ''
     }
 
     Write-Host ''
-    Write-Host '  OneDrive already syncs the libraries below. Relabeling a synced copy uses the' -ForegroundColor Gray
+    Write-Host '  OneDrive already syncs the libraries below. Labeling a synced copy uses the' -ForegroundColor Gray
     Write-Host '  Purview client, so it needs no metered API, no Azure billing, and no extra' -ForegroundColor Gray
     Write-Host '  approval; the client uploads each change back to SharePoint.' -ForegroundColor Gray
     $options = [ordered]@{}
@@ -2647,7 +2660,7 @@ function Read-LocalFolder {
         $options[[string]($index + 1)] = '{0}  ({1})' -f $synced[$index].Path, $synced[$index].Tenant
     }
     $options[[string]($synced.Count + 1)] = 'Type a different folder or UNC path'
-    $choice = [int](Read-MenuChoice -Title 'Which folder holds the files to relabel?' -Options $options -Default '1')
+    $choice = [int](Read-MenuChoice -Title 'Which folder holds the files to label?' -Options $options -Default '1')
     if ($choice -gt $synced.Count) { return Read-ValueWithDefault -Prompt 'Folder to scan' -Default '' }
     return [string]$synced[$choice - 1].Path
 }
@@ -2807,7 +2820,7 @@ function Resolve-PlanLabel {
     return $null
 }
 
-function Import-RelabelPlan {
+function Import-LabelingPlan {
     <# .SYNOPSIS Reads folder-to-label assignments from CSV and resolves each label against the tenant. #>
     [CmdletBinding()]
     param(
@@ -2837,7 +2850,7 @@ function Import-RelabelPlan {
             $labelText = [string](Get-ObjectPropertyValue -InputObject $row -Names 'Label')
             $label = Resolve-PlanLabel -Value $labelText -Labels $Labels
             if ($null -eq $label) {
-                Add-RunFailure -FilePath $Path -Action 'Read relabeling plan' -Reason "Line ${lineNumber}: label '$labelText' matches no file-capable tenant label, so the row was dropped."
+                Add-RunFailure -FilePath $Path -Action 'Read labeling plan' -Reason "Line ${lineNumber}: label '$labelText' matches no file-capable tenant label, so the row was dropped."
                 continue
             }
 
@@ -2847,7 +2860,7 @@ function Import-RelabelPlan {
                 if ($recurseText -match '^(?i)(true|yes|y|1)$') { $recurse = $true }
                 elseif ($recurseText -match '^(?i)(false|no|n|0)$') { $recurse = $false }
                 else {
-                    Add-RunFailure -FilePath $Path -Action 'Read relabeling plan' -Reason "Line ${lineNumber}: Recurse value '$recurseText' is neither true nor false, so the row was dropped."
+                    Add-RunFailure -FilePath $Path -Action 'Read labeling plan' -Reason "Line ${lineNumber}: Recurse value '$recurseText' is neither true nor false, so the row was dropped."
                     continue
                 }
             }
@@ -2866,16 +2879,16 @@ function Import-RelabelPlan {
         }
 
         if ($plan.Count -eq 0) { throw 'Every row was dropped, so there is nothing to process.' }
-        Write-RunLog -Severity SUCCESS -FilePath $Path -Action 'Read relabeling plan' -Result "Loaded $($plan.Count) folder assignments."
+        Write-RunLog -Severity SUCCESS -FilePath $Path -Action 'Read labeling plan' -Result "Loaded $($plan.Count) folder assignments."
         return @($plan)
     }
     catch {
-        Add-RunFailure -FilePath $Path -Action 'Read relabeling plan' -Reason $_.Exception.Message
+        Add-RunFailure -FilePath $Path -Action 'Read labeling plan' -Reason $_.Exception.Message
         return $null
     }
 }
 
-function Show-RelabelPlan {
+function Show-LabelingPlan {
     <# .SYNOPSIS Prints the folder-to-label assignments a batch run will process. #>
     [CmdletBinding()]
     param(
@@ -2884,7 +2897,7 @@ function Show-RelabelPlan {
     )
 
     Write-Host ''
-    Write-Host '  Relabeling plan' -ForegroundColor Cyan
+    Write-Host '  Labeling plan' -ForegroundColor Cyan
     Write-Host "    Root: $Root"
     $index = 0
     foreach ($row in $Rows) {
@@ -2894,11 +2907,11 @@ function Show-RelabelPlan {
         Write-Host "         label      : $($row.Label.Name)  (priority $($row.Label.Priority))"
         Write-Host "         subfolders : $($row.Recurse)"
         Write-Host "         extensions : $($row.Extensions -join ', ')"
-        Write-RunLog -Severity INFO -Action 'Relabeling plan' -Result "$folderText -> $($row.Label.Name); subfolders $($row.Recurse); $($row.Extensions -join ' ')" -NoConsole
+        Write-RunLog -Severity INFO -Action 'Labeling plan' -Result "$folderText -> $($row.Label.Name); subfolders $($row.Recurse); $($row.Extensions -join ' ')" -NoConsole
     }
 }
 
-function Join-RelabelPath {
+function Join-LabelingPath {
     <# .SYNOPSIS Combines the run root with one plan folder using the separator the source expects. #>
     [CmdletBinding()]
     param(
@@ -2958,9 +2971,9 @@ function Invoke-BatchRun {
     Write-Host '  The last row leaves Folder empty, which means the root itself.' -ForegroundColor Gray
     $csvPath = Read-ValueWithDefault -Prompt 'Path to the plan CSV' -Default ''
 
-    $plan = Import-RelabelPlan -Path $csvPath -Labels $labels -DefaultExtensions $defaultExtensions
+    $plan = Import-LabelingPlan -Path $csvPath -Labels $labels -DefaultExtensions $defaultExtensions
     if ($null -eq $plan) { return 'Main' }
-    Show-RelabelPlan -Rows $plan -Root $root
+    Show-LabelingPlan -Rows $plan -Root $root
 
     $action = Read-PhaseAction -Phase 'Plan review'
     if ($action -eq 'Exit') { return 'Exit' }
@@ -2983,7 +2996,7 @@ function Invoke-BatchRun {
     }
 
     foreach ($row in $plan) {
-        $targetPath = Join-RelabelPath -Root $root -Folder $row.Folder -Source $source
+        $targetPath = Join-LabelingPath -Root $root -Folder $row.Folder -Source $source
         Write-Host ''
         Write-Host "  Scanning $targetPath" -ForegroundColor Cyan
         Write-Host "    Label      : $($row.Label.Name)"
@@ -3020,7 +3033,7 @@ function Get-ConfidentialClientConfig {
 
     if ($script:IgnoreRemembered) { return $null }
     $found = @{}
-    foreach ($name in 'RELABEL_FILES_CC_CLIENT_ID', 'RELABEL_FILES_CC_TENANT_ID', 'RELABEL_FILES_CC_THUMBPRINT') {
+    foreach ($name in 'PURVIEW_FILE_LABELING_CC_CLIENT_ID', 'PURVIEW_FILE_LABELING_CC_TENANT_ID', 'PURVIEW_FILE_LABELING_CC_THUMBPRINT') {
         $value = ''
         foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTarget]::User) {
             try {
@@ -3033,9 +3046,9 @@ function Get-ConfidentialClientConfig {
         $found[$name] = $value
     }
     return [pscustomobject]@{
-        ClientId = $found['RELABEL_FILES_CC_CLIENT_ID']
-        TenantId = $found['RELABEL_FILES_CC_TENANT_ID']
-        Thumbprint = $found['RELABEL_FILES_CC_THUMBPRINT']
+        ClientId = $found['PURVIEW_FILE_LABELING_CC_CLIENT_ID']
+        TenantId = $found['PURVIEW_FILE_LABELING_CC_TENANT_ID']
+        Thumbprint = $found['PURVIEW_FILE_LABELING_CC_THUMBPRINT']
     }
 }
 
@@ -3049,9 +3062,9 @@ function Save-ConfidentialClientConfig {
     )
 
     $values = [ordered]@{
-        RELABEL_FILES_CC_CLIENT_ID = $ClientId
-        RELABEL_FILES_CC_TENANT_ID = $TenantId
-        RELABEL_FILES_CC_THUMBPRINT = $Thumbprint
+        PURVIEW_FILE_LABELING_CC_CLIENT_ID = $ClientId
+        PURVIEW_FILE_LABELING_CC_TENANT_ID = $TenantId
+        PURVIEW_FILE_LABELING_CC_THUMBPRINT = $Thumbprint
     }
     foreach ($name in $values.Keys) {
         [Environment]::SetEnvironmentVariable($name, $values[$name], [EnvironmentVariableTarget]::Process)
@@ -3070,13 +3083,13 @@ function Clear-ConfidentialClientConfig {
     # Read before clearing: once the thumbprint is gone the certificate can no longer be identified.
     $config = Get-ConfidentialClientConfig
     $thumbprint = if ($null -ne $config) { [string]$config.Thumbprint } else { '' }
-    foreach ($name in 'RELABEL_FILES_CC_CLIENT_ID', 'RELABEL_FILES_CC_TENANT_ID', 'RELABEL_FILES_CC_THUMBPRINT') {
+    foreach ($name in 'PURVIEW_FILE_LABELING_CC_CLIENT_ID', 'PURVIEW_FILE_LABELING_CC_TENANT_ID', 'PURVIEW_FILE_LABELING_CC_THUMBPRINT') {
         foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTarget]::User) {
             try { [Environment]::SetEnvironmentVariable($name, $null, $target) }
             catch { Write-Verbose "Could not clear ${name}: $($_.Exception.Message)" }
         }
     }
-    $note = if (Remove-RelabelCertificate -Thumbprint $thumbprint -Confirm:$false) {
+    $note = if (Remove-LabelingCertificate -Thumbprint $thumbprint -Confirm:$false) {
         'Its certificate was deleted from your personal certificate store as well.'
     }
     else { 'No certificate was left behind.' }
@@ -3158,7 +3171,7 @@ function Connect-SharePointAppOnly {
     return $false
 }
 
-function Get-RelabelCertificate {
+function Get-LabelingCertificate {
     <# .SYNOPSIS Finds certificates generated for one application, which the registration names after it. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ApplicationName)
@@ -3173,7 +3186,7 @@ function Get-RelabelCertificate {
     }
 }
 
-function Remove-RelabelCertificate {
+function Remove-LabelingCertificate {
     <# .SYNOPSIS Deletes a certificate this utility generated. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Thumbprint)
@@ -3193,7 +3206,7 @@ function Remove-RelabelCertificate {
     }
 }
 
-function Clear-UnusedRelabelCertificate {
+function Clear-UnusedLabelingCertificate {
     <# .SYNOPSIS Removes every certificate this run generated except the one the saved client still needs. #>
     [CmdletBinding()]
     param()
@@ -3204,20 +3217,21 @@ function Clear-UnusedRelabelCertificate {
     if ($null -ne $config) { $keep = [string]$config.Thumbprint }
     foreach ($thumbprint in @($script:CreatedCertificateThumbprints | Select-Object -Unique)) {
         if ($thumbprint -eq $keep) { continue }
-        $null = Remove-RelabelCertificate -Thumbprint $thumbprint -Confirm:$false
+        $null = Remove-LabelingCertificate -Thumbprint $thumbprint -Confirm:$false
     }
     $script:CreatedCertificateThumbprints.Clear()
 }
 
-function Clear-RelabelTemporaryArtifact {
+function Clear-LabelingTemporaryArtifact {
     <# .SYNOPSIS Removes temporary workers and certificate exports whose owning run has ended. #>
     [CmdletBinding()]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingEmptyCatchBlock', '', Justification = 'A missing owner process is the expected cleanup condition.')]
     param([switch]$IncludeCurrentProcess)
 
     $temporaryRoot = [System.IO.Path]::GetTempPath()
     $legacyCutoff = (Get-Date).AddHours(-1)
     $removed = 0
-    $namePattern = '^(?:RelabelGraph|RelabelAzure|RelabelCert|graphservices)-(?:(?<pid>\d+)-)?[0-9a-f]{32}(?:\.(?:ps1|json))?$'
+    $namePattern = '^(?:PurviewFileLabelingGraph|PurviewFileLabelingAzure|PurviewFileLabelingCert|graphservices)-(?:(?<pid>\d+)-)?[0-9a-f]{32}(?:\.(?:ps1|json))?$'
     foreach ($candidate in @(Get-ChildItem -LiteralPath $temporaryRoot -Force -ErrorAction SilentlyContinue)) {
         $nameMatch = [regex]::Match($candidate.Name, $namePattern)
         if (-not $nameMatch.Success) { continue }
@@ -3253,7 +3267,7 @@ function Clear-RelabelTemporaryArtifact {
     }
 }
 
-function Clear-OrphanedRelabelCertificate {
+function Clear-OrphanedLabelingCertificate {
     <# .SYNOPSIS Removes certificates from earlier runs that ended before they could clean up after themselves. #>
     [CmdletBinding()]
     param()
@@ -3267,7 +3281,7 @@ function Clear-OrphanedRelabelCertificate {
     $orphans = @()
     try {
         $orphans = @(Get-ChildItem Cert:\CurrentUser\My -ErrorAction Stop |
-                Where-Object { $_.Subject -like '*Purview Relabeling*' -and $_.Thumbprint -ne $keep })
+                Where-Object { $_.Subject -like '*Purview File Labeling*' -and $_.Thumbprint -ne $keep })
     }
     catch {
         Write-Verbose "Could not read the certificate store: $($_.Exception.Message)"
@@ -3277,7 +3291,7 @@ function Clear-OrphanedRelabelCertificate {
 
     Write-RunLog -Severity INFO -Action 'Remove certificate' -Result "Found $($orphans.Count) certificate(s) in your personal store from earlier runs that did not finish. They cannot authenticate anything, because the applications they belonged to were never saved, so they are being removed."
     foreach ($certificate in $orphans) {
-        $null = Remove-RelabelCertificate -Thumbprint $certificate.Thumbprint -Confirm:$false
+        $null = Remove-LabelingCertificate -Thumbprint $certificate.Thumbprint -Confirm:$false
     }
 }
 
@@ -3330,7 +3344,7 @@ function New-ConfidentialLabelingApplication {
     # redundant. They are directed to a temporary folder and deleted, rather than left in Downloads.
     # Registering signs in again, which replaces any SharePoint connection the caller was using.
     $script:SetupInterrupted = $true
-    $certificateOutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelCert-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
+    $certificateOutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('PurviewFileLabelingCert-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $certificateOutPath -Force -ErrorAction Stop
     $registrationName = $ApplicationName
     $registrationStarted = Get-Date
@@ -3373,7 +3387,7 @@ function New-ConfidentialLabelingApplication {
         }
         # Recorded so anything generated here is removed later unless it becomes the saved client's credential.
         # The time filter matters: a name can prefix-match a certificate this utility did not create.
-        foreach ($certificate in @(Get-RelabelCertificate -ApplicationName $registrationName)) {
+        foreach ($certificate in @(Get-LabelingCertificate -ApplicationName $registrationName)) {
             if ($certificate.NotBefore -lt $registrationStarted.AddMinutes(-5)) { continue }
             if (-not $script:CreatedCertificateThumbprints.Contains([string]$certificate.Thumbprint)) {
                 $script:CreatedCertificateThumbprints.Add([string]$certificate.Thumbprint)
@@ -3415,7 +3429,7 @@ function New-ConfidentialLabelingApplication {
     }
 }
 
-function Disable-RelabelApplication {
+function Disable-LabelingApplication {
     <# .SYNOPSIS Strips an application's permissions and disables its sign-in, then deletes it when that is allowed. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
@@ -3497,7 +3511,7 @@ function Get-GraphErrorText {
     return $full
 }
 
-function Disconnect-RelabelGraph {
+function Disconnect-LabelingGraph {
     <# .SYNOPSIS Signs the Microsoft Graph session out, in the separate process that owns it. #>
     [CmdletBinding()]
     param()
@@ -3510,7 +3524,7 @@ function Disconnect-RelabelGraph {
     }
 }
 
-function Grant-RelabelAdminConsent {
+function Grant-LabelingAdminConsent {
     <# .SYNOPSIS Creates the service principal and grants the application permissions the registration asks for. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
@@ -3637,42 +3651,212 @@ function Show-MeteredBillingCommand {
     Write-Host '  and owner rights on the application registration.' -ForegroundColor Gray
 }
 
+function Get-MeteredBillingResourceState {
+    <# .SYNOPSIS Validates that an ARM billing resource is provisioned for the intended Entra application. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Resource,
+        [Parameter(Mandatory)][string]$ClientId
+    )
+
+    if ($null -eq $Resource) {
+        return [pscustomobject]@{Status = 'Missing'; Message = 'The billing resource was not found.'}
+    }
+    $propertiesProperty = $Resource.PSObject.Properties['properties']
+    $properties = if ($propertiesProperty) { $propertiesProperty.Value } else { $null }
+    $actualClientId = Get-ObjectPropertyValue -InputObject $properties -Names 'appId', 'AppId'
+    $provisioningState = Get-ObjectPropertyValue -InputObject $properties -Names 'provisioningState', 'ProvisioningState'
+    if ([string]::IsNullOrWhiteSpace($provisioningState)) {
+        $provisioningState = Get-ObjectPropertyValue -InputObject $Resource -Names 'provisioningState', 'ProvisioningState'
+    }
+    if ([string]::IsNullOrWhiteSpace($actualClientId)) {
+        return [pscustomobject]@{Status = 'NotReady'; Message = 'The billing resource does not report an application ID.'}
+    }
+    if (-not [string]::Equals($actualClientId, $ClientId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [pscustomobject]@{Status = 'WrongApplication'; Message = "The billing resource is linked to application $actualClientId, not $ClientId."}
+    }
+    if ([string]::IsNullOrWhiteSpace($provisioningState)) {
+        return [pscustomobject]@{Status = 'Ready'; Message = "The billing resource is linked to application $ClientId. Azure did not report a provisioning state."}
+    }
+    if ($provisioningState -ne 'Succeeded') {
+        return [pscustomobject]@{Status = 'NotReady'; Message = "The billing resource reports state '$provisioningState' rather than Succeeded."}
+    }
+    return [pscustomobject]@{Status = 'Ready'; Message = "The billing resource is linked to application $ClientId and is provisioned."}
+}
+
 function Test-MeteredBillingResource {
-    <# .SYNOPSIS Reports whether the billing resource is already present, which a server-side error can still have left behind. #>
+    <# .SYNOPSIS Reports whether the billing resource is provisioned for the intended Entra application. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$ResourceName,
+        [Parameter(Mandatory)][string]$ClientId,
         [Parameter(Mandatory)][object]$Tool
     )
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
-            $null = & az graph-services account show --resource-group $ResourceGroup --resource-name $ResourceName `
-                --subscription $SubscriptionId --only-show-errors 2>&1
-            return ($LASTEXITCODE -eq 0)
+            # Microsoft documents list for the resource state, then show for the linked application ID.
+            $listOutput = & az resource list --resource-type 'Microsoft.GraphServices/accounts' `
+                --subscription $SubscriptionId --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $message = ("$listOutput" -replace '\s+', ' ').Trim()
+                $script:LastBillingResourceStatus = [pscustomobject]@{Status = 'LookupFailed'; Message = $message}
+                return $false
+            }
+            $match = @((ConvertFrom-AzureCliJson -Output $listOutput) | Where-Object {
+                    [string]::Equals((Get-ObjectPropertyValue -InputObject $_ -Names 'name', 'Name'), $ResourceName, [System.StringComparison]::OrdinalIgnoreCase) -and
+                    [string]::Equals((Get-ObjectPropertyValue -InputObject $_ -Names 'resourceGroup', 'ResourceGroup'), $ResourceGroup, [System.StringComparison]::OrdinalIgnoreCase)
+                } | Select-Object -First 1)
+            if ($match.Count -eq 0) {
+                $script:LastBillingResourceStatus = [pscustomobject]@{Status = 'Missing'; Message = 'The billing resource was not found in the selected subscription.'}
+                return $false
+            }
+            $output = & az resource show --resource-group $ResourceGroup --name $ResourceName `
+                --resource-type 'Microsoft.GraphServices/accounts' --subscription $SubscriptionId --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $message = ("$output" -replace '\s+', ' ').Trim()
+                $status = if ($message -match '(?i)ResourceNotFound|could not be found|not found') { 'Missing' } else { 'LookupFailed' }
+                $script:LastBillingResourceStatus = [pscustomobject]@{Status = $status; Message = $message}
+                return $false
+            }
+            $resource = ((@($output) -join [Environment]::NewLine) | ConvertFrom-Json -ErrorAction Stop)
+            $resource | Add-Member -NotePropertyName provisioningState -NotePropertyValue (Get-ObjectPropertyValue -InputObject $match[0] -Names 'provisioningState', 'ProvisioningState') -Force
+            $script:LastBillingResourceStatus = Get-MeteredBillingResourceState -Resource $resource -ClientId $ClientId
+            if ($script:LastBillingResourceStatus.Status -ne 'Ready') {
+                Write-RunLog -Severity WARN -Action 'Check metered billing' -Result $script:LastBillingResourceStatus.Message
+            }
+            return ($script:LastBillingResourceStatus.Status -eq 'Ready')
         }
+        $script:LastBillingResourceStatus = [pscustomobject]@{Status = 'LookupFailed'; Message = 'The Azure PowerShell fallback cannot verify the linked application ID.'}
         return $false
     }
     catch {
-        Write-Verbose "Billing resource lookup reported: $($_.Exception.Message)"
+        $script:LastBillingResourceStatus = [pscustomobject]@{Status = 'LookupFailed'; Message = (Get-ErrorText -ErrorRecord $_)}
+        Write-Verbose "Billing resource lookup reported: $($script:LastBillingResourceStatus.Message)"
         return $false
     }
 }
 
+function Test-MeteredBillingPreflight {
+    <# .SYNOPSIS Checks the Azure conditions that can be proved before creating the billing association. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Tool,
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$ResourceName,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId
+    )
+
+    if ($Tool.Kind -ne 'AzureCli') {
+        return [pscustomobject]@{Ready = $false; Message = 'This preflight must run inside the isolated Az worker for the Azure PowerShell route.'}
+    }
+
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $parsedClientId = [guid]::Empty
+    if (-not [guid]::TryParse($ClientId, [ref]$parsedClientId) -or $parsedClientId -eq [guid]::Empty) {
+        $problems.Add("Application $ClientId is not a valid client ID.")
+    }
+
+    try {
+        $cloudName = & az cloud show --query name --output tsv --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $problems.Add("Azure could not read the active cloud: $(("$cloudName" -replace '\s+', ' ').Trim())")
+        }
+        elseif ("$cloudName".Trim() -ne 'AzureCloud') {
+            $problems.Add("Azure CLI is set to '$(("$cloudName").Trim())'. Metered Graph APIs require the global AzureCloud environment.")
+        }
+
+        $accountOutput = & az account show --subscription $SubscriptionId --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $problems.Add("Azure could not read subscription ${SubscriptionId}: $(("$accountOutput" -replace '\s+', ' ').Trim())")
+        }
+        else {
+            $account = @((ConvertFrom-AzureCliJson -Output $accountOutput) | Select-Object -First 1)
+            if ($account.Count -eq 0) {
+                $problems.Add("Azure did not return details for subscription $SubscriptionId.")
+            }
+            else {
+                $accountTenantId = Get-ObjectPropertyValue -InputObject $account[0] -Names 'tenantId', 'homeTenantId'
+                $accountState = Get-ObjectPropertyValue -InputObject $account[0] -Names 'state'
+                if (-not [string]::IsNullOrWhiteSpace($accountState) -and $accountState -ne 'Enabled') {
+                    $problems.Add("Subscription $SubscriptionId is in state '$accountState', not Enabled.")
+                }
+                if (-not [string]::IsNullOrWhiteSpace($TenantId) -and -not [string]::IsNullOrWhiteSpace($accountTenantId) -and
+                    -not [string]::Equals($accountTenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $problems.Add("Subscription $SubscriptionId belongs to tenant $accountTenantId, not application tenant $TenantId.")
+                }
+            }
+        }
+
+        $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId --output none --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $problems.Add("Resource group '$ResourceGroup' cannot be read in subscription ${SubscriptionId}: $(("$groupOutput" -replace '\s+', ' ').Trim())")
+        }
+
+        $providerState = & az provider show --namespace Microsoft.GraphServices --subscription $SubscriptionId `
+            --query registrationState --output tsv --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $problems.Add("Azure could not read Microsoft.GraphServices registration: $(("$providerState" -replace '\s+', ' ').Trim())")
+        }
+        elseif ("$providerState".Trim() -ne 'Registered') {
+            $problems.Add("Microsoft.GraphServices is '$(("$providerState").Trim())', not Registered.")
+        }
+
+        if ($problems.Count -eq 0) {
+            $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-validate-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
+            try {
+                $template = [ordered]@{
+                    '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
+                    contentVersion = '1.0.0.0'
+                    resources = @([ordered]@{
+                            type = 'Microsoft.GraphServices/accounts'
+                            apiVersion = '2023-04-13'
+                            name = $ResourceName
+                            location = 'global'
+                            properties = [ordered]@{appId = $ClientId}
+                        })
+                }
+                Set-Content -LiteralPath $templatePath -Value ($template | ConvertTo-Json -Depth 8) -Encoding utf8 -ErrorAction Stop
+                $validation = & az deployment group validate --subscription $SubscriptionId --resource-group $ResourceGroup `
+                    --template-file $templatePath --only-show-errors 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    $problems.Add("Azure Resource Manager could not validate the billing resource deployment: $(("$validation" -replace '\s+', ' ').Trim())")
+                }
+            }
+            finally {
+                Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch {
+        $problems.Add((Get-ErrorText -ErrorRecord $_))
+    }
+
+    if ($problems.Count -gt 0) {
+        return [pscustomobject]@{Ready = $false; Message = ($problems -join ' ')}
+    }
+    return [pscustomobject]@{Ready = $true; Message = "Global Azure, subscription $SubscriptionId, resource group '$ResourceGroup', Microsoft.GraphServices, and ARM deployment validation are ready for the documented billing association command."}
+}
+
 function Set-MeteredBillingResourceDirect {
-    <# .SYNOPSIS Creates the billing resource through generic ARM, which needs no preview extension and can name the API version. #>
+    <# .SYNOPSIS Creates and verifies the billing resource through generic ARM when the Graph Services extension is refused. #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$ResourceName,
-        [Parameter(Mandatory)][string]$ClientId
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][object]$Tool
     )
 
     # Passed as a file because inline JSON is mangled differently by every shell this may run in.
     $propertiesPath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
+    $templatePath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-template-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
+    $script:LastBillingFallbackError = ''
     try {
         Set-Content -LiteralPath $propertiesPath -Value ('{"appId":"' + $ClientId + '"}') -Encoding utf8 -ErrorAction Stop
         # These are the only two versions the resource type has, and each reaches a different service code path.
@@ -3681,15 +3865,46 @@ function Set-MeteredBillingResourceDirect {
             $output = & az resource create --subscription $SubscriptionId --resource-group $ResourceGroup --name $ResourceName `
                 --resource-type 'Microsoft.GraphServices/accounts' --api-version $apiVersion --location global `
                 --properties "@$propertiesPath" --only-show-errors 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The generic ARM route succeeded on API version $apiVersion."
+            $commandSucceeded = ($LASTEXITCODE -eq 0)
+            if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
+                $result = if ($commandSucceeded) { 'succeeded' } else { 'returned an error after creating the resource' }
+                Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The generic ARM route $result on API version $apiVersion, and generic verification confirmed the billing link."
                 return $true
             }
+            $script:LastBillingFallbackError = "Generic ARM API version ${apiVersion}: $(("$output" -replace '\s+', ' ').Trim())"
             Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "API version $apiVersion was refused: $(("$output" -replace '\s+', ' ').Trim())"
         }
+
+        $template = [ordered]@{
+            '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
+            contentVersion = '1.0.0.0'
+            resources = @([ordered]@{
+                    type = 'Microsoft.GraphServices/accounts'
+                    apiVersion = '2023-04-13'
+                    name = $ResourceName
+                    location = 'global'
+                    properties = [ordered]@{appId = $ClientId}
+                })
+        }
+        Set-Content -LiteralPath $templatePath -Value ($template | ConvertTo-Json -Depth 8) -Encoding utf8 -ErrorAction Stop
+        $deploymentName = 'purview-file-labeling-billing-' + [guid]::NewGuid().ToString('N').Substring(0, 16)
+        Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Trying an ARM template deployment, which uses Azure Resource Manager instead of the Graph Services extension.'
+        $output = & az deployment group create --subscription $SubscriptionId --resource-group $ResourceGroup --name $deploymentName `
+            --template-file $templatePath --only-show-errors 2>&1
+        $commandSucceeded = ($LASTEXITCODE -eq 0)
+        if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
+            $result = if ($commandSucceeded) { 'created' } else { 'returned an error after creating' }
+            Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The ARM template deployment $result the billing resource, and generic verification confirmed the link."
+            return $true
+        }
+        $script:LastBillingFallbackError = "ARM template deployment: $(("$output" -replace '\s+', ' ').Trim())"
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "The ARM template deployment was refused or could not be verified: $(($output -replace '\s+', ' ').Trim())"
         return $false
     }
-    finally { Remove-Item -LiteralPath $propertiesPath -Force -ErrorAction SilentlyContinue }
+    finally {
+        Remove-Item -LiteralPath $propertiesPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $templatePath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-AzureAction {
@@ -3713,7 +3928,7 @@ function Invoke-AzureAction {
         return [pscustomobject]@{Status = 'Error'; Message = 'PowerShell 7 is needed to talk to Azure separately from PnP.'; Value = @(); Correlation = @()}
     }
 
-    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelAzure-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('PurviewFileLabelingAzure-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $worker = @'
 param([string]$Action, [string]$ArgumentJson, [string]$TenantId)
 $ErrorActionPreference = 'Stop'
@@ -3820,8 +4035,38 @@ try {
             $resourceGroup = [string]$arguments['ResourceGroup']
             $resourceName = [string]$arguments['ResourceName']
             $clientId = [string]$arguments['ClientId']
-            $null = Set-AzContext -Subscription $subscriptionId -ErrorAction Stop
+            $selected = Set-AzContext -Subscription $subscriptionId -ErrorAction Stop
             Import-AzResourcesModule
+
+            $environmentName = [string]$selected.Environment.Name
+            if ($environmentName -ne 'AzureCloud') {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Azure is set to '$environmentName'. Metered Graph APIs require the global AzureCloud environment."
+                break
+            }
+            $subscription = @(Get-AzSubscription -SubscriptionId $subscriptionId -ErrorAction Stop | Select-Object -First 1)
+            if ($subscription.Count -eq 0) {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Azure could not read subscription $subscriptionId."
+                break
+            }
+            if ([string]$subscription[0].State -ne 'Enabled') {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Subscription $subscriptionId is in state '$($subscription[0].State)', not Enabled."
+                break
+            }
+            if (-not [string]::IsNullOrWhiteSpace($TenantId) -and -not [string]::IsNullOrWhiteSpace([string]$subscription[0].TenantId) -and
+                -not [string]::Equals([string]$subscription[0].TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Subscription $subscriptionId belongs to tenant $($subscription[0].TenantId), not application tenant $TenantId."
+                break
+            }
+            try { $null = Get-AzResourceGroup -Name $resourceGroup -ErrorAction Stop }
+            catch {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Resource group '$resourceGroup' cannot be read in subscription ${subscriptionId}: $($_.Exception.Message)"
+                break
+            }
 
             function Test-Exists { try { return [bool](Get-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $resourceGroup -Name $resourceName -ErrorAction SilentlyContinue) } catch { return $false } }
             'PROGRESS:Checking whether the billing resource already exists.'
@@ -3844,7 +4089,30 @@ try {
                 "PROGRESS:Waiting for the provider to report itself registered ($wait of 6)."
                 Start-Sleep -Seconds 10
             }
-            $result.Message = if ($registered) { 'provider registered' } else { 'provider registration unconfirmed' }
+            if (-not $registered) {
+                $result.Status = 'PreflightFailed'
+                $result.Message = 'Microsoft.GraphServices did not report Registered after provider registration.'
+                break
+            }
+            if (-not (Get-Command Test-AzResourceGroupDeployment -ErrorAction SilentlyContinue)) {
+                $result.Status = 'PreflightFailed'
+                $result.Message = 'Az.Resources does not provide Test-AzResourceGroupDeployment, so it cannot validate the billing deployment without creating it. Install or use the Azure CLI.'
+                break
+            }
+            $validationTemplate = @{
+                '$schema' = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#'
+                contentVersion = '1.0.0.0'
+                resources = @(@{ type = 'Microsoft.GraphServices/accounts'; apiVersion = '2023-04-13'; name = $resourceName; location = 'global'; properties = @{appId = $clientId} })
+            }
+            try {
+                $null = Test-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -TemplateObject $validationTemplate -ErrorAction Stop
+            }
+            catch {
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Azure Resource Manager could not validate the billing resource deployment: $($_.Exception.Message)"
+                break
+            }
+            $result.Message = 'Global Azure, subscription, resource group, Microsoft.GraphServices, and ARM deployment validation are ready.'
 
             $versions = @()
             try {
@@ -3903,7 +4171,7 @@ try {
                             contentVersion = '1.0.0.0'
                             resources = @(@{ type = 'Microsoft.GraphServices/accounts'; apiVersion = $route.Api; name = $resourceName; location = 'global'; properties = @{ appId = $clientId } })
                         }
-                        $null = New-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -TemplateObject $template -Name ('relabel-billing-' + (Get-Date -Format 'yyyyMMddHHmmss')) -ErrorAction Stop
+                        $null = New-AzResourceGroupDeployment -ResourceGroupName $resourceGroup -TemplateObject $template -Name ('purview-file-labeling-billing-' + (Get-Date -Format 'yyyyMMddHHmmss')) -ErrorAction Stop
                     }
                     else {
                         $null = New-AzResource -ResourceType 'Microsoft.GraphServices/accounts' -ResourceGroupName $resourceGroup -Name $resourceName -Location global -Properties @{ appId = $clientId } -ApiVersion $route.Api -Force -ErrorAction Stop
@@ -3995,16 +4263,16 @@ function Save-PendingBillingLink {
     )
 
     # None of these identify anything secret; they are the same values the Azure portal shows.
-    Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_CLIENT_ID' -Value $ClientId
-    Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_TENANT_ID' -Value $TenantId
-    Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_SUBSCRIPTION' -Value $SubscriptionId
-    Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_GROUP' -Value $ResourceGroup
-    Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_NAME' -Value $ResourceName
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_CLIENT_ID' -Value $ClientId
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_TENANT_ID' -Value $TenantId
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_SUBSCRIPTION' -Value $SubscriptionId
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_GROUP' -Value $ResourceGroup
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_NAME' -Value $ResourceName
     # The signature and count are what let a later run tell a passing outage from a permanent refusal.
     if (-not [string]::IsNullOrWhiteSpace($Signature)) {
-        Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_SIGNATURE' -Value $Signature.Substring(0, [math]::Min(120, $Signature.Length))
+        Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_SIGNATURE' -Value $Signature.Substring(0, [math]::Min(120, $Signature.Length))
     }
-    if ($FailureCount -gt 0) { Save-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_FAILURES' -Value ([string]$FailureCount) }
+    if ($FailureCount -gt 0) { Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_FAILURES' -Value ([string]$FailureCount) }
 }
 
 function Get-PendingBillingLink {
@@ -4012,24 +4280,24 @@ function Get-PendingBillingLink {
     [CmdletBinding()]
     param()
 
-    $clientId = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_CLIENT_ID'
-    $subscriptionId = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_SUBSCRIPTION'
-    $resourceGroup = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_GROUP'
-    $resourceName = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_NAME'
+    $clientId = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_CLIENT_ID'
+    $subscriptionId = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_SUBSCRIPTION'
+    $resourceGroup = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_GROUP'
+    $resourceName = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_NAME'
     if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($subscriptionId) -or
         [string]::IsNullOrWhiteSpace($resourceGroup) -or [string]::IsNullOrWhiteSpace($resourceName)) {
         return $null
     }
-    $failureText = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_FAILURES'
+    $failureText = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_FAILURES'
     $failureCount = 0
     if (-not [int]::TryParse($failureText, [ref]$failureCount)) { $failureCount = 0 }
     return [pscustomobject]@{
         ClientId = $clientId
-        TenantId = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_TENANT_ID'
+        TenantId = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_TENANT_ID'
         SubscriptionId = $subscriptionId
         ResourceGroup = $resourceGroup
         ResourceName = $resourceName
-        Signature = Get-RememberedValue -Name 'RELABEL_FILES_PENDING_BILLING_SIGNATURE'
+        Signature = Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_PENDING_BILLING_SIGNATURE'
         FailureCount = $failureCount
     }
 }
@@ -4039,9 +4307,9 @@ function Clear-PendingBillingLink {
     [CmdletBinding()]
     param()
 
-    foreach ($name in 'RELABEL_FILES_PENDING_BILLING_CLIENT_ID', 'RELABEL_FILES_PENDING_BILLING_TENANT_ID',
-        'RELABEL_FILES_PENDING_BILLING_SUBSCRIPTION', 'RELABEL_FILES_PENDING_BILLING_GROUP', 'RELABEL_FILES_PENDING_BILLING_NAME',
-        'RELABEL_FILES_PENDING_BILLING_SIGNATURE', 'RELABEL_FILES_PENDING_BILLING_FAILURES') {
+    foreach ($name in 'PURVIEW_FILE_LABELING_PENDING_BILLING_CLIENT_ID', 'PURVIEW_FILE_LABELING_PENDING_BILLING_TENANT_ID',
+        'PURVIEW_FILE_LABELING_PENDING_BILLING_SUBSCRIPTION', 'PURVIEW_FILE_LABELING_PENDING_BILLING_GROUP', 'PURVIEW_FILE_LABELING_PENDING_BILLING_NAME',
+        'PURVIEW_FILE_LABELING_PENDING_BILLING_SIGNATURE', 'PURVIEW_FILE_LABELING_PENDING_BILLING_FAILURES') {
         foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTarget]::User) {
             try { [Environment]::SetEnvironmentVariable($name, $null, $target) }
             catch { Write-Verbose "Could not clear ${name}: $($_.Exception.Message)" }
@@ -4189,43 +4457,61 @@ function Set-MeteredBillingLink {
 
     if (-not $PSCmdlet.ShouldProcess("subscription $SubscriptionId", "Create billing resource '$ResourceName' for application $ClientId")) { return $false }
 
+    $script:LastBillingPreflightFailed = $false
+    $script:LastBillingWasProviderFault = $false
     try {
         if ($Tool.Kind -eq 'AzureCli') {
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Using the Azure CLI. A browser sign-in may appear if the CLI is not already signed in.'
-            # The graph-services command group ships in the graphservices extension package.
-            $extensionOutput = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "az extension add failed: $(($extensionOutput -join ' ').Trim())" }
             # Every command receives the subscription explicitly, so this utility never changes the
             # default subscription of an Azure CLI session that was already open.
-            if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
+            if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
                 Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' already exists in $ResourceGroup, so nothing needed creating."
                 $script:LastBillingWasServiceFault = $false
+                $script:LastBillingWasProviderFault = $false
                 Clear-PendingBillingLink
                 return $true
+            }
+            if ($script:LastBillingResourceStatus.Status -ne 'Missing') {
+                $script:LastBillingPreflightFailed = $true
+                Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason $script:LastBillingResourceStatus.Message
+                return $false
             }
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Registering the Microsoft.GraphServices resource provider on that subscription. This can take a minute the first time.'
             $providerOutput = & az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --wait --only-show-errors 2>&1
             if ($LASTEXITCODE -ne 0) { throw "az provider register failed: $(($providerOutput -join ' ').Trim())" }
-            $output = ''
-            $delaySeconds = 15
+            $preflight = Test-MeteredBillingPreflight -Tool $Tool -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
+                -ResourceName $ResourceName -ClientId $ClientId -TenantId $TenantId
+            if (-not $preflight.Ready) {
+                $script:LastBillingPreflightFailed = $true
+                Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason $preflight.Message
+                return $false
+            }
+            Write-RunLog -Severity SUCCESS -Action 'Preflight metered billing' -Result $preflight.Message
+            # The graph-services command group ships in the graphservices extension package.
+            $extensionOutput = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "az extension add failed: $(($extensionOutput -join ' ').Trim())" }
+            $output = & az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName `
+                --subscription $SubscriptionId --location global --app-id $ClientId 2>&1
             $created = $false
-            for ($attempt = 1; $attempt -le 4 -and -not $created; $attempt++) {
-                $output = & az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName --subscription $SubscriptionId --location global --app-id $ClientId 2>&1
-                if ($LASTEXITCODE -eq 0) { $created = $true; break }
-                $propagating = "$output" -match '(?i)MissingSubscriptionRegistration|not registered to use namespace'
-                if ($attempt -lt 4 -and ($propagating -or (Test-AzureServiceFailure -Message "$output"))) {
-                    $reason = if ($propagating) { 'The Microsoft.GraphServices registration is still propagating.' } else { 'Azure returned a server-side error.' }
-                    Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "$reason Waiting $delaySeconds seconds, then retrying (attempt $attempt of 4)."
-                    Start-Sleep -Seconds $delaySeconds
-                    $delaySeconds = [math]::Min($delaySeconds * 2, 60)
-                    continue
+            if ($LASTEXITCODE -eq 0) {
+                $created = Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
+                    -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool
+                if (-not $created) {
+                    throw "az graph-services account create completed, but $($script:LastBillingResourceStatus.Message)"
                 }
-                break
             }
-            if (-not $created) {
-                $created = Set-MeteredBillingResourceDirect -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId
+            else {
+                $primaryError = (("$output" -replace '\s+', ' ').Trim())
+                if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
+                    $created = $true
+                    Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result 'Azure returned an error after creating the resource, but generic ARM verification confirmed the billing link.'
+                }
+                else {
+                    $created = Set-MeteredBillingResourceDirect -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
+                        -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool
+                    if (-not $created) { throw "az graph-services account create failed: $primaryError Generic ARM fallbacks also failed: $($script:LastBillingFallbackError)" }
+                }
             }
-            if (-not $created) { throw "az graph-services account create failed: $($output -join ' ')" }
         }
         else {
             if (-not (Get-Module -ListAvailable -Name Az.Resources -ErrorAction SilentlyContinue)) { throw 'Az.Resources is not available.' }
@@ -4241,8 +4527,14 @@ function Set-MeteredBillingLink {
             if ($response.Status -eq 'Exists') {
                 Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' already exists in $ResourceGroup, so nothing needed creating."
                 $script:LastBillingWasServiceFault = $false
+                $script:LastBillingWasProviderFault = $false
                 Clear-PendingBillingLink
                 return $true
+            }
+            if ($response.Status -eq 'PreflightFailed') {
+                $script:LastBillingPreflightFailed = $true
+                Add-RunFailure -FilePath '' -Action 'Preflight metered billing' -Reason ([string]$response.Message)
+                return $false
             }
             if ($response.Status -eq 'ClientFault') {
                 Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The Azure module failed to load in its own process, so no route reached Azure at all. That is a fault on this machine, not a rejection by Azure.'
@@ -4283,30 +4575,38 @@ function Set-MeteredBillingLink {
         }
         Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Application $ClientId is now billed to subscription $SubscriptionId through resource '$ResourceName'."
         $script:LastBillingWasServiceFault = $false
+        $script:LastBillingWasProviderFault = $false
         Clear-PendingBillingLink
         return $true
     }
     catch {
         $text = Get-GraphErrorText -ErrorRecord $_
         # A server-side failure can still have created the resource, so confirm before reporting a failure.
-        if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
+        if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId -Tool $Tool) {
             Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Azure reported an error, but billing resource '$ResourceName' exists, so application $ClientId is linked."
             $script:LastBillingWasServiceFault = $false
+            $script:LastBillingWasProviderFault = $false
             Clear-PendingBillingLink
             return $true
         }
         $script:LastBillingWasServiceFault = [bool](Test-AzureServiceFailure -Message $text)
+        $script:LastBillingWasProviderFault = [bool](Test-AzureProviderImplementationFailure -Message $text)
         $script:LastBillingWasClientFault = $false
         $script:LastBillingFailureSignature = Get-FailureSignature -Message $text
         if ($Quiet) { return $false }
         Add-RunFailure -FilePath '' -Action 'Link metered billing' -Reason $text
-        if ($script:LastBillingWasServiceFault) {
+        if ($script:LastBillingWasProviderFault) {
             Write-Host ''
-            Write-Host '  This is a fault on the Azure side, not a rejection of your request.' -ForegroundColor Yellow
-            Write-Host '  The subscription, the resource group, the application and your permissions' -ForegroundColor Gray
-            Write-Host '  are all fine. The Microsoft.GraphServices provider itself failed to respond.' -ForegroundColor Gray
-            Write-Host '  Nothing was charged and nothing was half-created. The request itself matches' -ForegroundColor Gray
-            Write-Host '  what Microsoft documents, so there is nothing to correct at this end.' -ForegroundColor Gray
+            Write-Host '  Microsoft.GraphServices returned an OpenTelemetry type-load failure.' -ForegroundColor Yellow
+            Write-Host '  That is a provider implementation error; retrying from this machine or Cloud' -ForegroundColor Gray
+            Write-Host '  Shell cannot change the provider assemblies. The pending link is retained, but' -ForegroundColor Gray
+            Write-Host '  startup will not retry this exact failure automatically.' -ForegroundColor Gray
+        }
+        elseif ($script:LastBillingWasServiceFault) {
+            Write-Host ''
+            Write-Host '  Azure returned a server-side error while creating the billing resource.' -ForegroundColor Yellow
+            Write-Host '  Preflight completed, but it cannot prove Microsoft.GraphServices create backend' -ForegroundColor Gray
+            Write-Host '  health. The full error is in the run log, with correlation IDs below if present.' -ForegroundColor Gray
             if ($script:LastBillingCorrelationIds.Count -gt 0) {
                 Write-Host ''
                 Write-Host '  If it never recovers, raise it with Azure support and quote these correlation IDs:' -ForegroundColor Gray
@@ -4387,7 +4687,7 @@ function Invoke-MeteredSetup {
             }) -Default '1'
         if ($choice -eq '5') { return 'Main' }
         if ($choice -eq '2') {
-            $null = Grant-RelabelAdminConsent -ClientId $existing.ClientId -TenantId $existing.TenantId -Confirm:$false
+            $null = Grant-LabelingAdminConsent -ClientId $existing.ClientId -TenantId $existing.TenantId -Confirm:$false
             return 'Main'
         }
         if ($choice -eq '4') {
@@ -4396,7 +4696,7 @@ function Invoke-MeteredSetup {
                     '2' = 'No, only forget it here (it keeps its permissions in the tenant)'
                 }) -Default '1'
             if ($removeChoice -eq '1') {
-                $null = Disable-RelabelApplication -ClientId $existing.ClientId -TenantId $existing.TenantId -Confirm:$false
+                $null = Disable-LabelingApplication -ClientId $existing.ClientId -TenantId $existing.TenantId -Confirm:$false
             }
             else {
                 Write-RunLog -Severity WARN -Action 'Forget confidential client' -Result "Application $($existing.ClientId) stays in tenant $($existing.TenantId) holding application-level Files.ReadWrite.All. Remove it in the Entra admin center when it is no longer needed."
@@ -4426,13 +4726,13 @@ function Invoke-MeteredSetup {
 
     Write-Host ''
     Write-Host '  The tenant is read from SharePoint itself, so no GUID has to be typed.' -ForegroundColor Gray
-    $siteUrl = Read-ValueWithDefault -Prompt 'Any site URL in the tenant (for example https://contoso.sharepoint.com/sites/LabelTest)' -Default (Get-RememberedValue -Name 'RELABEL_FILES_SITE_URL')
+    $siteUrl = Read-ValueWithDefault -Prompt 'Any site URL in the tenant (for example https://contoso.sharepoint.com/sites/LabelTest)' -Default (Get-RememberedValue -Name 'PURVIEW_FILE_LABELING_SITE_URL')
     if ($siteUrl -notmatch '^https://[^/]+\.') {
         Write-RunLog -Severity WARN -Action 'Validate site URL' -Result 'Enter the full site URL, starting with https://.'
         return 'Main'
     }
     $siteUrl = $siteUrl.TrimEnd('/')
-    Save-RememberedValue -Name 'RELABEL_FILES_SITE_URL' -Value $siteUrl
+    Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_SITE_URL' -Value $siteUrl
     $tenantId = Get-SharePointTenantId -SiteUrl $siteUrl
     if ([string]::IsNullOrWhiteSpace($tenantId)) {
         Add-RunFailure -FilePath $siteUrl -Action 'Resolve tenant' -Reason 'SharePoint did not return a tenant realm, so no application was registered.'
@@ -4440,7 +4740,7 @@ function Invoke-MeteredSetup {
     }
     Write-RunLog -Severity SUCCESS -Action 'Resolve tenant' -Result "SharePoint reports tenant $tenantId."
 
-    $applicationName = Read-ValueWithDefault -Prompt 'Application display name' -Default 'Purview Relabeling - Confidential Client'
+    $applicationName = Read-ValueWithDefault -Prompt 'Application display name' -Default 'Purview File Labeling - Confidential Client'
     $confirm = Read-MenuChoice -Title "Register '$applicationName' in tenant $tenantId with application-level Graph Files.ReadWrite.All?" -Options ([ordered]@{
             '1' = 'No, return to the main menu (default)'
             '2' = 'Yes, register it now'
@@ -4458,7 +4758,7 @@ function Invoke-MeteredSetup {
     Save-ConfidentialClientConfig -ClientId $application.ClientId -TenantId $application.TenantId -Thumbprint $application.Thumbprint
     if (-not [string]::IsNullOrWhiteSpace($replaceOldClientId)) {
         Write-RunLog -Severity INFO -Action 'Replace confidential client' -Result "The replacement is registered and saved, so the previous application $replaceOldClientId is being removed now."
-        $null = Disable-RelabelApplication -ClientId $replaceOldClientId -TenantId $replaceOldTenantId -Confirm:$false
+        $null = Disable-LabelingApplication -ClientId $replaceOldClientId -TenantId $replaceOldTenantId -Confirm:$false
     }
     Write-Host ''
     Write-Host "  Application : $($application.ClientId)" -ForegroundColor Green
@@ -4472,7 +4772,7 @@ function Invoke-MeteredSetup {
             '2' = 'No, I will grant it in the Entra admin center'
         }) -Default '1'
     if ($consentChoice -eq '1') {
-        $null = Grant-RelabelAdminConsent -ClientId $application.ClientId -TenantId $application.TenantId -Confirm:$false
+        $null = Grant-LabelingAdminConsent -ClientId $application.ClientId -TenantId $application.TenantId -Confirm:$false
     }
     else {
         Show-AdminConsentInstruction -ClientId $application.ClientId
@@ -4489,8 +4789,8 @@ function Invoke-MeteredSetup {
             '2' = 'No, keep it so a later run can finish the billing link'
         }) -Default '1'
     if ($rollbackChoice -eq '1') {
-        $null = Disable-RelabelApplication -ClientId $application.ClientId -TenantId $application.TenantId -Confirm:$false
-        $null = Remove-RelabelCertificate -Thumbprint $application.Thumbprint -Confirm:$false
+        $null = Disable-LabelingApplication -ClientId $application.ClientId -TenantId $application.TenantId -Confirm:$false
+        $null = Remove-LabelingCertificate -Thumbprint $application.Thumbprint -Confirm:$false
         Clear-ConfidentialClientConfig
         Clear-PendingBillingLink
         Write-RunLog -Severity SUCCESS -Action 'Undo setup' -Result 'The application, its certificate, and the pending billing link were all removed. Nothing from this attempt is left behind.'
@@ -4508,12 +4808,6 @@ function Connect-AzureCommandLine {
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
-            $existingAccount = & az account show --query 'user.name' --output tsv --only-show-errors 2>$null
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$existingAccount")) {
-                $script:AzureCliAccount = "$existingAccount".Trim()
-                Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Reusing the existing Azure CLI sign-in.'
-                return $true
-            }
             Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure CLI sign-in. Use the account that owns the subscription to be billed.'
             $arguments = [System.Collections.Generic.List[string]]::new()
             $arguments.Add('login')
@@ -4718,12 +5012,23 @@ function Select-AzureSubscription {
     }
     if ($subscriptions.Count -eq 0) { return '' }
 
-    # The billing subscription has to live in the same tenant as the application, so a mismatch is called out rather than hidden.
+    $wrongTenant = @($subscriptions | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($TenantId) -and -not [string]::IsNullOrWhiteSpace($_.TenantId) -and
+            -not [string]::Equals($_.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    if ($wrongTenant.Count -gt 0) {
+        Write-RunLog -Severity WARN -Action 'List subscriptions' -Result "Excluded $($wrongTenant.Count) subscription(s) from a different tenant. Metered Graph billing requires the subscription and application to be in the same tenant."
+        $subscriptions = @($subscriptions | Where-Object { $wrongTenant.Id -notcontains $_.Id })
+    }
+    if ($subscriptions.Count -eq 0) {
+        Write-RunLog -Severity WARN -Action 'List subscriptions' -Result "No subscription in tenant $TenantId is available for metered Graph billing."
+        return ''
+    }
+
     $options = [ordered]@{}
     for ($index = 0; $index -lt $subscriptions.Count; $index++) {
         $subscription = $subscriptions[$index]
-        $note = if (-not [string]::IsNullOrWhiteSpace($TenantId) -and $subscription.TenantId -and $subscription.TenantId -ne $TenantId) { '  [different tenant - not usable]' } else { '' }
-        $options[[string]($index + 1)] = '{0}  ({1}){2}' -f $subscription.Name, $subscription.Id, $note
+        $options[[string]($index + 1)] = '{0}  ({1})' -f $subscription.Name, $subscription.Id
     }
     $options[[string]($subscriptions.Count + 1)] = 'Type a subscription ID instead'
     $choice = Read-MenuChoice -Title 'Choose the Azure subscription that should be billed.' -Options $options -Default '1'
@@ -4769,7 +5074,7 @@ function Read-NewAzureResourceGroup {
         [Parameter(Mandatory)][AllowEmptyString()][string]$DefaultLocation
     )
 
-    $name = Read-ValueWithDefault -Prompt 'Name for the new resource group' -Default 'purview-relabeling-rg'
+    $name = Read-ValueWithDefault -Prompt 'Name for the new resource group' -Default 'purview-file-labeling-rg'
     $location = Read-ValueWithDefault -Prompt 'Azure region for it' -Default $(if ([string]::IsNullOrWhiteSpace($DefaultLocation)) { 'eastus' } else { $DefaultLocation })
     if (-not (New-AzureResourceGroup -Tool $Tool -SubscriptionId $SubscriptionId -Name $name -Location $location -Confirm:$false)) { return '' }
     return $name
@@ -4828,9 +5133,8 @@ function Wait-ForBillingLink {
     Write-Host ''
     Write-Host '  Two things are still worth trying, and neither depends on this machine. Cloud Shell' -ForegroundColor Gray
     Write-Host '  is the route Microsoft documents, and runs in the browser with the Azure CLI already' -ForegroundColor Gray
-    Write-Host '  installed. A different subscription matters because metered Graph billing is a' -ForegroundColor Gray
-    Write-Host '  commerce operation, and credit-based subscriptions, Visual Studio benefits among' -ForegroundColor Gray
-    Write-Host '  them, do not support it.' -ForegroundColor Gray
+    Write-Host '  installed. A different subscription only helps when it is enabled, in the same' -ForegroundColor Gray
+    Write-Host '  tenant as the application, and your account has the required Contributor access.' -ForegroundColor Gray
 
     $choice = Read-MenuChoice -Title 'How should that be handled?' -Options ([ordered]@{
             '1' = 'Create it in Azure Cloud Shell, in the browser (default)'
@@ -4860,9 +5164,12 @@ function Invoke-BillingLinkOnOtherSubscription {
         [Parameter(Mandatory)][object]$Tool
     )
 
-    $others = @(Get-AzureSubscriptionList -Tool $Tool | Where-Object { $_.Id -ne $Pending.SubscriptionId })
+    $others = @(Get-AzureSubscriptionList -Tool $Tool | Where-Object {
+            $_.Id -ne $Pending.SubscriptionId -and
+            ([string]::IsNullOrWhiteSpace($_.TenantId) -or [string]::Equals($_.TenantId, $Pending.TenantId, [System.StringComparison]::OrdinalIgnoreCase))
+        })
     if ($others.Count -eq 0) {
-        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'That is the only Azure subscription this account can see, so there is no other one to try. Create or gain access to a standard pay-as-you-go subscription in this tenant, then choose option 3 again.'
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'That is the only Azure subscription this account can see in the application tenant, so there is no other one to try. Gain access to another enabled subscription in this tenant with Contributor rights, then choose option 3 again.'
         return $false
     }
     $options = [ordered]@{}
@@ -4881,6 +5188,10 @@ function Invoke-BillingLinkOnOtherSubscription {
             -TenantId $Pending.TenantId -Confirm:$false) {
         return $true
     }
+    if ($script:LastBillingPreflightFailed) {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The documented create command was not attempted because the selected subscription did not pass billing preflight.'
+        return $false
+    }
     Save-PendingBillingLink -ClientId $Pending.ClientId -TenantId $Pending.TenantId -SubscriptionId $subscriptionId `
         -ResourceGroup $resourceGroup -ResourceName $Pending.ResourceName -Signature $script:LastBillingFailureSignature -FailureCount 1
     Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'That subscription was refused in the same way, which points at the provider rather than the subscription.'
@@ -4894,6 +5205,10 @@ function Resume-PendingBillingLink {
 
     $pending = Get-PendingBillingLink
     if ($null -eq $pending) { return }
+    if (Test-AzureProviderImplementationFailure -Message $pending.Signature) {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The pending link ended with a Microsoft.GraphServices OpenTelemetry type-load failure, so it is not retried automatically. Use the main-menu setup option after the provider recovers or Azure support resolves it.'
+        return
+    }
     $tool = Get-AzureResourceTool
     if ($null -eq $tool) { return }
 
@@ -4904,6 +5219,10 @@ function Resume-PendingBillingLink {
         Write-Host ''
         Write-Host '  The Azure billing link left over from an earlier run has now completed,' -ForegroundColor Green
         Write-Host '  so applying labels in SharePoint is available again.' -ForegroundColor Green
+        return
+    }
+    if ($script:LastBillingPreflightFailed) {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The saved billing link still fails prerequisite preflight, so it is not retried automatically. Correct the reported prerequisite, then choose option 3 to run preflight again.'
         return
     }
     # Each unattended retry that fails is counted, so the advice hardens rather than repeating itself.
@@ -4940,18 +5259,21 @@ function Read-MeteredBillingSetting {
     }
     Write-RunLog -Severity INFO -Action 'Link metered billing' -Result "Using $($tool.Kind) ($($tool.Detail))."
 
-    # Azure resolves the application when it creates the billing resource, so a missing service principal fails there.
-    if ((Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals') -eq 'Missing') {
+    # Azure resolves the application when it creates the billing resource, so a missing service principal must be fixed first.
+    $servicePrincipalState = Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals'
+    if ($servicePrincipalState -eq 'Missing') {
         Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId has no service principal in tenant $TenantId, which means administrator consent has not been granted yet. Azure looks the application up while creating the billing resource, so linking now is likely to fail."
         $consentFirst = Read-MenuChoice -Title 'Grant administrator consent first?' -Options ([ordered]@{
                 '1' = 'Yes, grant it now, then link billing'
-                '2' = 'No, try linking billing anyway'
-                '3' = 'Stop and return to the main menu'
+                '2' = 'No, return to the main menu'
             }) -Default '1'
-        if ($consentFirst -eq '3') { return $false }
-        if ($consentFirst -eq '1' -and (Grant-RelabelAdminConsent -ClientId $ClientId -TenantId $TenantId -Confirm:$false)) {
-            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Waiting a few seconds for the new service principal to replicate.'
-            Start-Sleep -Seconds 15
+        if ($consentFirst -ne '1') { return $false }
+        if (-not (Grant-LabelingAdminConsent -ClientId $ClientId -TenantId $TenantId -Confirm:$false)) { return $false }
+        Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Waiting a few seconds for the new service principal to replicate.'
+        Start-Sleep -Seconds 15
+        if ((Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals') -eq 'Missing') {
+            Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId still has no service principal in tenant $TenantId after consent. The billing command was not attempted."
+            return $false
         }
     }
 
@@ -4973,11 +5295,25 @@ function Read-MeteredBillingSetting {
         Write-RunLog -Severity WARN -Action 'Validate subscription' -Result "'$subscriptionId' is not a valid subscription GUID."
         return $false
     }
+    $knownSubscription = @(Get-AzureSubscriptionList -Tool $tool | Where-Object { $_.Id -eq $parsedSubscription.ToString() } | Select-Object -First 1)
+    if ($knownSubscription.Count -eq 0) {
+        Write-RunLog -Severity WARN -Action 'Validate subscription' -Result "Subscription $($parsedSubscription.ToString()) could not be verified from the Azure account. Sign in with an account that can access it, then run billing setup again."
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($TenantId) -and -not [string]::IsNullOrWhiteSpace($knownSubscription[0].TenantId) -and
+        -not [string]::Equals($knownSubscription[0].TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-RunLog -Severity WARN -Action 'Validate subscription' -Result "Subscription $($parsedSubscription.ToString()) belongs to tenant $($knownSubscription[0].TenantId), not application tenant $TenantId."
+        return $false
+    }
     $resourceGroup = Select-AzureResourceGroup -Tool $tool -SubscriptionId $parsedSubscription.ToString()
     if ([string]::IsNullOrWhiteSpace($resourceGroup)) { return $false }
-    $resourceName = Read-ValueWithDefault -Prompt 'Name for the billing resource' -Default 'purview-relabeling-billing'
+    $resourceName = Read-ValueWithDefault -Prompt 'Name for the billing resource' -Default 'purview-file-labeling-billing'
 
     if (-not (Set-MeteredBillingLink -ClientId $ClientId -SubscriptionId $parsedSubscription.ToString() -ResourceGroup $resourceGroup -ResourceName $resourceName -Tool $tool -TenantId $TenantId -Confirm:$false)) {
+        if ($script:LastBillingPreflightFailed) {
+            Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The documented billing association command was not attempted because preflight found a subscription, tenant, resource-group, provider, or authorization problem.'
+            return $false
+        }
         # Saved whatever the cause, so the choice that follows never has to ask for these details again.
         $previous = Get-PendingBillingLink
         $failures = 1
@@ -4998,7 +5334,7 @@ function Read-MeteredBillingSetting {
     return $true
 }
 
-function Get-RelabelRememberedVariable {
+function Get-LabelingRememberedVariable {
     <# .SYNOPSIS Lists the environment variables this utility owns and currently has set. #>
     [CmdletBinding()]
     param()
@@ -5009,7 +5345,7 @@ function Get-RelabelRememberedVariable {
         try { $all = [Environment]::GetEnvironmentVariables($target) }
         catch { Write-Verbose "Could not read the $target environment: $($_.Exception.Message)"; continue }
         foreach ($name in @($all.Keys)) {
-            if ([string]$name -notmatch '^(RELABEL_FILES_|LABEL_TEST_SITE_)') { continue }
+            if ([string]$name -notmatch '^(PURVIEW_FILE_LABELING_|LABEL_TEST_SITE_)') { continue }
             # Clearing a variable can leave an empty entry behind, which is nothing to report or clear again.
             if ([string]::IsNullOrWhiteSpace([string]$all[$name])) { continue }
             $owned.Add([pscustomobject]@{
@@ -5022,12 +5358,12 @@ function Get-RelabelRememberedVariable {
     return @($owned)
 }
 
-function Clear-RelabelRememberedValue {
+function Clear-LabelingRememberedValue {
     <# .SYNOPSIS Forgets everything this utility remembers, so no earlier run supplies a default. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param()
 
-    $owned = @(Get-RelabelRememberedVariable)
+    $owned = @(Get-LabelingRememberedVariable)
     if ($owned.Count -eq 0) {
         Write-RunLog -Severity INFO -Action 'Forget settings' -Result 'Nothing is remembered, so there is nothing to clear.'
     }
@@ -5076,7 +5412,7 @@ function Clear-RelabelRememberedValue {
         }
     }
     $script:RejectedClientIds.Clear()
-    if ($script:GraphSessionOpened) { Disconnect-RelabelGraph }
+    Disconnect-LabelingGraph
     Write-RunLog -Severity INFO -Action 'Forget settings' -Result 'The certificate of any confidential client is still in your personal certificate store, and the applications themselves still exist in Entra ID.'
 }
 
@@ -5206,7 +5542,7 @@ function Invoke-GuidedRun {
 }
 
 Write-Host ''
-Write-Host '  Microsoft Purview File Relabeling Utility' -ForegroundColor Cyan
+Write-Host '  Microsoft Purview File Labeling Utility' -ForegroundColor Cyan
 # Printed because running an old extracted copy by mistake is otherwise invisible.
 $script:BuildStamp = ''
 try {
@@ -5226,15 +5562,15 @@ if ($Restarted) {
     Write-Host "  Restarted in PowerShell $($PSVersionTable.PSVersion). The SharePoint Online source is available here." -ForegroundColor Green
 }
 elseif ($PSVersionTable.PSVersion -lt [version]'7.2.0') {
-    Write-Host '  This host relabels local/UNC paths and mounted SharePoint Server libraries.' -ForegroundColor Yellow
+    Write-Host '  This host labels files on local/UNC paths and mounted SharePoint Server libraries.' -ForegroundColor Yellow
     Write-Host '  Choosing SharePoint Online offers to restart in PowerShell 7.' -ForegroundColor Yellow
 }
-Write-RunLog -Severity INFO -Action 'Start utility' -Result 'Microsoft Purview file relabeling utility started. No write occurs unless Apply mode is selected and confirmed.' -NoConsole
+Write-RunLog -Severity INFO -Action 'Start utility' -Result 'Microsoft Purview file labeling utility started. No write occurs unless Apply mode is selected and confirmed.' -NoConsole
 Write-RunEnvironment
 Test-DependencyDrift
 # A killed process cannot execute finally, so recover its temporary workers and certificate exports
 # before this run prompts, signs in, or makes a network request.
-Clear-RelabelTemporaryArtifact
+Clear-LabelingTemporaryArtifact
 $exitRequested = $false
 try {
     # Asked once, before the menu, so an unreachable source costs no sign-in and the question is not repeated for every run.
@@ -5251,7 +5587,7 @@ try {
     Resume-PendingBillingLink
 
     # A run that crashed or was closed could not clean up after itself, so its leftovers are swept here.
-    Clear-OrphanedRelabelCertificate
+    Clear-OrphanedLabelingCertificate
 
     while (-not $exitRequested) {
         $sourceLabel = if ($script:Source -eq 'SharePoint') { 'SharePoint Online (metered API for Apply)' } else { 'local/UNC/SharePoint Server path (Purview client)' }
@@ -5282,7 +5618,7 @@ try {
                 if ([string]::IsNullOrWhiteSpace($changedSource)) { $exitRequested = $true }
                 else { $script:Source = $changedSource }
             }
-            '5' { Clear-RelabelRememberedValue -Confirm:$false }
+            '5' { Clear-LabelingRememberedValue -Confirm:$false }
             '6' { Show-RunSummary }
             '7' { $exitRequested = $true }
         }
@@ -5302,14 +5638,14 @@ finally {
     }
     Disconnect-LabelDiscoveryService
     Disconnect-SharePointSession
-    if ($script:GraphSessionOpened) { Disconnect-RelabelGraph }
+    if ($script:GraphSessionOpened) { Disconnect-LabelingGraph }
     Disconnect-AzureSession
     # Nothing this run generated is left behind unless the saved client still needs it.
-    Clear-UnusedRelabelCertificate
-    Clear-RelabelTemporaryArtifact -IncludeCurrentProcess
+    Clear-UnusedLabelingCertificate
+    Clear-LabelingTemporaryArtifact -IncludeCurrentProcess
     # Swept again by name, because a certificate abandoned earlier in this run was never recorded
     # here, and a restart is not an ending so it keeps its work.
-    if (-not $script:RelaunchCompleted) { Clear-OrphanedRelabelCertificate }
+    if (-not $script:RelaunchCompleted) { Clear-OrphanedLabelingCertificate }
 }
 
 # Started here, not inside a function, so the restarted run writes straight to this console.
