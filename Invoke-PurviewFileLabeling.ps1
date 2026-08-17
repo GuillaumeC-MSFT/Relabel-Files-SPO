@@ -28,7 +28,7 @@ $script:UtilityVersion = '1.1.0'
 $script:ModuleExpectation = @(
     [pscustomobject]@{ Name = 'PnP.PowerShell'; Minimum = [version]'2.12.0'; Purpose = 'the SharePoint Online source' }
     [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Minimum = [version]'3.0.0'; Purpose = 'reading the sensitivity labels published in your tenant' }
-    [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Minimum = [version]'2.0.0'; Purpose = 'registering an application and granting consent' }
+    [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Minimum = [version]'2.0.0'; Purpose = 'the explicit administrator-consent fallback when Azure CLI cannot complete it' }
     [pscustomobject]@{ Name = 'Az.Accounts'; Minimum = [version]'2.12.0'; Purpose = 'linking Azure billing for metered writes' }
     [pscustomobject]@{ Name = 'Az.Resources'; Minimum = [version]'6.0.0'; Purpose = 'linking Azure billing for metered writes' }
 )
@@ -46,6 +46,8 @@ $script:SharePointSessionOpened = $false
 $script:GraphSessionOpened = $false
 $script:AzureCliSessionOpened = $false
 $script:AzureCliAccount = ''
+$script:AzureCliIsolatedConfigDirectory = ''
+$script:AzureCliPreviousConfigDirectory = $null
 $script:AzurePowerShellSessionOpened = $false
 $script:CachedLabels = $null
 $script:EmptyInputCount = 0
@@ -656,6 +658,28 @@ function Get-ObjectPropertyValue {
         if ($property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) { return [string]$property.Value }
     }
     return ''
+}
+
+function Get-RawObjectPropertyValue {
+    <# .SYNOPSIS Returns a property without converting nested objects or arrays to text. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$InputObject,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        foreach ($name in $Names) {
+            if ($InputObject.Contains($name)) { return $InputObject[$name] }
+        }
+        return $null
+    }
+    foreach ($name in $Names) {
+        $property = $InputObject.PSObject.Properties[$name]
+        if ($property) { return $property.Value }
+    }
+    return $null
 }
 
 function Request-SelfRestart {
@@ -3341,7 +3365,7 @@ function Clear-LabelingTemporaryArtifact {
     $temporaryRoot = [System.IO.Path]::GetTempPath()
     $legacyCutoff = (Get-Date).AddHours(-1)
     $removed = 0
-    $namePattern = '^(?:PurviewFileLabelingGraph|PurviewFileLabelingAzure|PurviewFileLabelingCert|graphservices)-(?:(?<pid>\d+)-)?[0-9a-f]{32}(?:\.(?:ps1|json))?$'
+    $namePattern = '^(?:PurviewFileLabelingGraph|PurviewFileLabelingAzureCli|PurviewFileLabelingAzure|PurviewFileLabelingCert|graphservices)-(?:(?<pid>\d+)-)?[0-9a-f]{32}(?:\.(?:ps1|json))?$'
     foreach ($candidate in @(Get-ChildItem -LiteralPath $temporaryRoot -Force -ErrorAction SilentlyContinue)) {
         $nameMatch = [regex]::Match($candidate.Name, $namePattern)
         if (-not $nameMatch.Success) { continue }
@@ -3373,7 +3397,7 @@ function Clear-LabelingTemporaryArtifact {
         }
     }
     if ($removed -gt 0) {
-        Write-RunLog -Severity INFO -Action 'Remove temporary artifact' -Result "Removed $removed temporary worker or certificate-export artifact(s) left by completed runs."
+        Write-RunLog -Severity INFO -Action 'Remove temporary artifact' -Result "Removed $removed temporary worker, Azure CLI profile, or certificate-export artifact(s) left by completed runs."
     }
 }
 
@@ -3622,6 +3646,269 @@ function Get-GraphErrorText {
     return $full
 }
 
+function Get-AzureCliAccountContext {
+    <# .SYNOPSIS Returns the active Azure CLI user without exposing its cached access tokens. #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $output = & az account show --output json --only-show-errors 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $accounts = @(ConvertFrom-AzureCliJson -Output $output)
+        if ($accounts.Count -eq 0) { return $null }
+        $account = $accounts[0]
+        $user = Get-RawObjectPropertyValue -InputObject $account -Names 'user'
+        return [pscustomobject]@{
+            TenantId = [string](Get-ObjectPropertyValue -InputObject $account -Names 'tenantId', 'homeTenantId')
+            SubscriptionId = [string](Get-ObjectPropertyValue -InputObject $account -Names 'id')
+            UserName = [string](Get-ObjectPropertyValue -InputObject $user -Names 'name')
+            UserType = [string](Get-ObjectPropertyValue -InputObject $user -Names 'type')
+        }
+    }
+    catch {
+        Write-Verbose "Could not read the active Azure CLI account: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-AzureCliApplicationConsentState {
+    <# .SYNOPSIS Verifies the application, service principal, and every requested application-role assignment. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ClientId,
+        [AllowNull()][object]$Application = $null
+    )
+
+    try {
+        if ($null -eq $Application) {
+            $applicationOutput = & az ad app show --id $ClientId --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $message = (($applicationOutput -join ' ') -replace '\s+', ' ').Trim()
+                $status = if ($message -match '(?i)does not exist|not found|ResourceNotFound|Request_ResourceNotFound') { 'ApplicationMissing' } else { 'Unknown' }
+                return [pscustomobject]@{Status = $status; Count = 0; Message = "Azure CLI could not read application ${ClientId}: $message"}
+            }
+            $applications = @(ConvertFrom-AzureCliJson -Output $applicationOutput)
+            if ($applications.Count -eq 0) {
+                return [pscustomobject]@{Status = 'Unknown'; Count = 0; Message = "Azure CLI returned no application for $ClientId."}
+            }
+            $Application = $applications[0]
+        }
+
+        $requestedRoles = [System.Collections.Generic.List[object]]::new()
+        foreach ($resource in @(Get-RawObjectPropertyValue -InputObject $Application -Names 'requiredResourceAccess')) {
+            $resourceAppId = [string](Get-ObjectPropertyValue -InputObject $resource -Names 'resourceAppId')
+            foreach ($access in @(Get-RawObjectPropertyValue -InputObject $resource -Names 'resourceAccess')) {
+                if ([string](Get-ObjectPropertyValue -InputObject $access -Names 'type') -ne 'Role') { continue }
+                $requestedRoles.Add([pscustomobject]@{
+                        ResourceAppId = $resourceAppId
+                        AppRoleId = [string](Get-ObjectPropertyValue -InputObject $access -Names 'id')
+                    })
+            }
+        }
+        if ($requestedRoles.Count -eq 0) {
+            return [pscustomobject]@{Status = 'ApplicationInvalid'; Count = 0; Message = 'The registration requests no application permissions.'}
+        }
+
+        $principalOutput = & az ad sp show --id $ClientId --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $message = (($principalOutput -join ' ') -replace '\s+', ' ').Trim()
+            $status = if ($message -match '(?i)does not exist|not found|ResourceNotFound|Request_ResourceNotFound') { 'ConsentMissing' } else { 'Unknown' }
+            return [pscustomobject]@{Status = $status; Count = 0; Message = "Azure CLI could not read the application service principal: $message"}
+        }
+        $principals = @(ConvertFrom-AzureCliJson -Output $principalOutput)
+        $principalId = if ($principals.Count -eq 0) { '' } else { [string](Get-ObjectPropertyValue -InputObject $principals[0] -Names 'id') }
+        if ([string]::IsNullOrWhiteSpace($principalId)) {
+            return [pscustomobject]@{Status = 'Unknown'; Count = 0; Message = 'The application service principal has no directory object ID.'}
+        }
+
+        $assignmentUrl = "https://graph.microsoft.com/v1.0/servicePrincipals/$principalId/appRoleAssignments?`$select=appRoleId,resourceId"
+        $assignmentOutput = & az rest --method get --url $assignmentUrl --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return [pscustomobject]@{Status = 'Unknown'; Count = 0; Message = "Azure CLI could not verify application-role assignments: $(($assignmentOutput -join ' ').Trim())"}
+        }
+        $assignmentResponses = @(ConvertFrom-AzureCliJson -Output $assignmentOutput)
+        $assignments = if ($assignmentResponses.Count -eq 0) { @() } else {
+            @(Get-RawObjectPropertyValue -InputObject $assignmentResponses[0] -Names 'value')
+        }
+        $resourcePrincipalIds = @{}
+        $missingRoles = [System.Collections.Generic.List[string]]::new()
+        foreach ($role in $requestedRoles) {
+            if (-not $resourcePrincipalIds.ContainsKey($role.ResourceAppId)) {
+                $resourceOutput = & az ad sp show --id $role.ResourceAppId --query id --output tsv --only-show-errors 2>&1
+                if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace("$resourceOutput")) {
+                    return [pscustomobject]@{Status = 'Unknown'; Count = 0; Message = "Azure CLI could not read resource service principal $($role.ResourceAppId): $(($resourceOutput -join ' ').Trim())"}
+                }
+                $resourcePrincipalIds[$role.ResourceAppId] = "$resourceOutput".Trim()
+            }
+            $resourcePrincipalId = [string]$resourcePrincipalIds[$role.ResourceAppId]
+            $matched = @($assignments | Where-Object {
+                    [string]::Equals([string](Get-ObjectPropertyValue -InputObject $_ -Names 'appRoleId'), $role.AppRoleId, [System.StringComparison]::OrdinalIgnoreCase) -and
+                    [string]::Equals([string](Get-ObjectPropertyValue -InputObject $_ -Names 'resourceId'), $resourcePrincipalId, [System.StringComparison]::OrdinalIgnoreCase)
+                }).Count -gt 0
+            if (-not $matched) { $missingRoles.Add("$($role.ResourceAppId)/$($role.AppRoleId)") }
+        }
+        if ($missingRoles.Count -gt 0) {
+            return [pscustomobject]@{Status = 'ConsentMissing'; Count = $requestedRoles.Count - $missingRoles.Count; Message = "These requested application permissions are not assigned: $($missingRoles -join ', ')."}
+        }
+        return [pscustomobject]@{Status = 'Ready'; Count = $requestedRoles.Count; Message = "$($requestedRoles.Count) requested application permission(s) are assigned."}
+    }
+    catch {
+        return [pscustomobject]@{Status = 'Unknown'; Count = 0; Message = "Azure CLI could not verify application consent for ${ClientId}: $(Get-ErrorText -ErrorRecord $_)"}
+    }
+}
+
+function Start-IsolatedAzureCliProfile {
+    <# .SYNOPSIS Gives utility-owned Azure authentication a temporary profile, preserving the user's normal CLI state. #>
+    [CmdletBinding()]
+    param()
+
+    if (-not [string]::IsNullOrWhiteSpace($script:AzureCliIsolatedConfigDirectory)) { return $true }
+    $directory = Join-Path ([System.IO.Path]::GetTempPath()) ('PurviewFileLabelingAzureCli-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop
+        $script:AzureCliPreviousConfigDirectory = [Environment]::GetEnvironmentVariable('AZURE_CONFIG_DIR', [EnvironmentVariableTarget]::Process)
+        [Environment]::SetEnvironmentVariable('AZURE_CONFIG_DIR', $directory, [EnvironmentVariableTarget]::Process)
+        $script:AzureCliIsolatedConfigDirectory = $directory
+        Write-RunLog -Severity INFO -Action 'Prepare Azure CLI' -NoConsole -Result "Using temporary Azure CLI profile $directory so this run cannot change or sign out a pre-existing CLI account."
+        return $true
+    }
+    catch {
+        $reason = Get-ErrorText -ErrorRecord $_
+        try {
+            [Environment]::SetEnvironmentVariable('AZURE_CONFIG_DIR', $script:AzureCliPreviousConfigDirectory, [EnvironmentVariableTarget]::Process)
+            if (Test-Path -LiteralPath $directory) { Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction Stop }
+        }
+        catch { Write-Verbose "Could not roll back temporary Azure CLI profile ${directory}: $($_.Exception.Message)" }
+        $script:AzureCliIsolatedConfigDirectory = ''
+        $script:AzureCliPreviousConfigDirectory = $null
+        Write-RunLog -Severity WARN -Action 'Prepare Azure CLI' -Result "Could not create an isolated Azure CLI profile: $reason"
+        return $false
+    }
+}
+
+function Clear-IsolatedAzureCliProfile {
+    <# .SYNOPSIS Restores the previous Azure CLI profile and removes only this run's temporary credentials. #>
+    [CmdletBinding()]
+    param()
+
+    $directory = $script:AzureCliIsolatedConfigDirectory
+    if ([string]::IsNullOrWhiteSpace($directory)) { return }
+    try {
+        [Environment]::SetEnvironmentVariable('AZURE_CONFIG_DIR', $script:AzureCliPreviousConfigDirectory, [EnvironmentVariableTarget]::Process)
+        if (Test-Path -LiteralPath $directory) {
+            Remove-Item -LiteralPath $directory -Recurse -Force -ErrorAction Stop
+        }
+        Write-RunLog -Severity INFO -Action 'Disconnect Azure CLI' -Result 'Removed this run''s temporary Azure CLI profile and restored the pre-existing CLI profile unchanged.'
+    }
+    catch {
+        Write-RunLog -Severity WARN -Action 'Disconnect Azure CLI' -Result "Could not remove temporary Azure CLI profile ${directory}: $(Get-ErrorText -ErrorRecord $_)"
+    }
+    finally {
+        $script:AzureCliIsolatedConfigDirectory = ''
+        $script:AzureCliPreviousConfigDirectory = $null
+        $script:AzureCliSessionOpened = $false
+        $script:AzureCliAccount = ''
+    }
+}
+
+function Grant-LabelingAdminConsentViaAzureCli {
+    <# .SYNOPSIS Uses the active Azure CLI identity for application ownership and administrator consent. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][string]$TenantId
+    )
+
+    $result = [ordered]@{Status = 'Error'; Message = ''; Value = ''; Count = 0}
+    try {
+        $context = Get-AzureCliAccountContext
+        if ($null -eq $context -or
+            -not [string]::Equals($context.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.Status = 'NoSession'
+            $result.Message = "Azure CLI is not signed in to application tenant $TenantId."
+            return [pscustomobject]$result
+        }
+        if (-not [string]::Equals($context.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.Message = 'Azure CLI is signed in as a service principal or managed identity. Administrator consent and direct application ownership require a user account.'
+            return [pscustomobject]$result
+        }
+
+        $applicationOutput = & az ad app show --id $ClientId --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not read application ${ClientId}: $(($applicationOutput -join ' ').Trim())" }
+        $applications = @(ConvertFrom-AzureCliJson -Output $applicationOutput)
+        if ($applications.Count -eq 0) { throw "Azure CLI returned no application for $ClientId." }
+        $application = $applications[0]
+
+        $requestedRoles = [System.Collections.Generic.List[object]]::new()
+        foreach ($resource in @(Get-RawObjectPropertyValue -InputObject $application -Names 'requiredResourceAccess')) {
+            $resourceAppId = [string](Get-ObjectPropertyValue -InputObject $resource -Names 'resourceAppId')
+            foreach ($access in @(Get-RawObjectPropertyValue -InputObject $resource -Names 'resourceAccess')) {
+                if ([string](Get-ObjectPropertyValue -InputObject $access -Names 'type') -ne 'Role') { continue }
+                $requestedRoles.Add([pscustomobject]@{
+                        ResourceAppId = $resourceAppId
+                        AppRoleId = [string](Get-ObjectPropertyValue -InputObject $access -Names 'id')
+                    })
+            }
+        }
+        if ($requestedRoles.Count -eq 0) { throw 'The registration requests no application permissions, so there is nothing to consent to.' }
+
+        $operatorOutput = & az ad signed-in-user show --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not identify its signed-in user: $(($operatorOutput -join ' ').Trim())" }
+        $operators = @(ConvertFrom-AzureCliJson -Output $operatorOutput)
+        if ($operators.Count -eq 0) { throw 'Azure CLI returned no signed-in user.' }
+        $operator = $operators[0]
+        $operatorId = [string](Get-ObjectPropertyValue -InputObject $operator -Names 'id')
+        if ([string]::IsNullOrWhiteSpace($operatorId)) { throw 'Azure CLI returned no object ID for its signed-in user.' }
+
+        $ownerOutput = & az ad app owner list --id $ClientId --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not list application owners: $(($ownerOutput -join ' ').Trim())" }
+        $ownerIds = @((ConvertFrom-AzureCliJson -Output $ownerOutput) | ForEach-Object {
+                [string](Get-ObjectPropertyValue -InputObject $_ -Names 'id')
+            })
+        if ($ownerIds -notcontains $operatorId) {
+            $ownerAddOutput = & az ad app owner add --id $ClientId --owner-object-id $operatorId --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not assign the signed-in user as application owner: $(($ownerAddOutput -join ' ').Trim())" }
+            $ownerOutput = & az ad app owner list --id $ClientId --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not verify application ownership: $(($ownerOutput -join ' ').Trim())" }
+            $ownerIds = @((ConvertFrom-AzureCliJson -Output $ownerOutput) | ForEach-Object {
+                    [string](Get-ObjectPropertyValue -InputObject $_ -Names 'id')
+                })
+            if ($ownerIds -notcontains $operatorId) { throw "Application owner assignment for object $operatorId could not be verified." }
+        }
+
+        $principalOutput = & az ad sp show --id $ClientId --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $principalOutput = & az ad sp create --id $ClientId --output json --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not create the service principal: $(($principalOutput -join ' ').Trim())" }
+        }
+        $principals = @(ConvertFrom-AzureCliJson -Output $principalOutput)
+        if ($principals.Count -eq 0) { throw 'Azure CLI returned no service principal.' }
+        $principalId = [string](Get-ObjectPropertyValue -InputObject $principals[0] -Names 'id')
+        if ([string]::IsNullOrWhiteSpace($principalId)) { throw 'The service principal has no directory object ID.' }
+
+        $consentOutput = & az ad app permission admin-consent --id $ClientId --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "Azure CLI could not grant administrator consent: $(($consentOutput -join ' ').Trim())" }
+
+        $consentState = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $consentState = Get-AzureCliApplicationConsentState -ClientId $ClientId -Application $application
+            if ($consentState.Status -eq 'Ready' -or $consentState.Status -ne 'ConsentMissing' -or $attempt -eq 3) { break }
+            Write-RunLog -Severity INFO -Action 'Grant admin consent' -NoConsole -Result "Consent succeeded but its role assignments are not visible yet; read-only verification attempt $attempt of 3 will be repeated."
+            Start-Sleep -Seconds 3
+        }
+        if ($consentState.Status -ne 'Ready') { throw "Administrator consent could not be verified: $($consentState.Message)" }
+
+        $operatorName = [string](Get-ObjectPropertyValue -InputObject $operator -Names 'userPrincipalName', 'displayName')
+        if ([string]::IsNullOrWhiteSpace($operatorName)) { $operatorName = $context.UserName }
+        if ([string]::IsNullOrWhiteSpace($operatorName)) { $operatorName = $operatorId }
+        $result.Status = 'Granted'
+        $result.Value = $operatorName
+        $result.Count = $consentState.Count
+    }
+    catch { $result.Message = Get-ErrorText -ErrorRecord $_ }
+    return [pscustomobject]$result
+}
+
 function Disconnect-LabelingGraph {
     <# .SYNOPSIS Signs the Microsoft Graph session out, in the separate process that owns it. #>
     [CmdletBinding()]
@@ -3640,10 +3927,47 @@ function Grant-LabelingAdminConsent {
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory)][string]$ClientId,
-        [Parameter(Mandatory)][string]$TenantId
+        [Parameter(Mandatory)][string]$TenantId,
+        [switch]$PreferAzureCli
     )
 
     if (-not $PSCmdlet.ShouldProcess("application $ClientId", 'Create the service principal and grant its application permissions')) { return $false }
+
+    if ($PreferAzureCli -and (Get-Command az -CommandType Application -ErrorAction SilentlyContinue)) {
+        $tool = [pscustomobject]@{Kind = 'AzureCli'; Detail = [string](Get-Command az -CommandType Application | Select-Object -First 1).Source}
+        $context = Get-AzureCliAccountContext
+        if ($null -eq $context -or
+            -not [string]::Equals($context.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($context.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-RunLog -Severity INFO -Action 'Grant admin consent' -Result 'One Azure CLI sign-in will be reused for administrator consent, application ownership, prerequisite checks, and billing.'
+            if (-not (Connect-AzureCommandLine -Tool $tool -TenantId $TenantId)) {
+                Write-RunLog -Severity WARN -Action 'Grant admin consent' -Result 'Azure CLI sign-in did not complete, so consent and billing were not attempted. No second sign-in was opened.'
+                return $false
+            }
+        }
+        $context = Get-AzureCliAccountContext
+        if ($null -eq $context -or
+            -not [string]::Equals($context.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($context.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-RunLog -Severity WARN -Action 'Grant admin consent' -Result "Azure CLI has no user session in application tenant $TenantId, so consent and billing were not attempted."
+            return $false
+        }
+        $cliResponse = Grant-LabelingAdminConsentViaAzureCli -ClientId $ClientId -TenantId $TenantId
+        if ($cliResponse.Status -eq 'Granted') {
+            Write-RunLog -Severity SUCCESS -Action 'Grant admin consent' -Result "Consent is granted through the reused Azure CLI account: $($cliResponse.Count) application permission(s) are assigned to $ClientId in tenant $TenantId, and $($cliResponse.Value) is verified as an application owner."
+            return $true
+        }
+        Write-RunLog -Severity WARN -Action 'Grant admin consent' -Result "The reused Azure CLI account could not complete consent: $($cliResponse.Message)"
+        $fallback = Read-MenuChoice -Title 'Open a separate Microsoft Graph administrator sign-in as a fallback?' -Options ([ordered]@{
+                '1' = 'No, stop here and keep the current Azure CLI session (default)'
+                '2' = 'Yes, open one separate Microsoft Graph sign-in'
+            }) -Default '1'
+        if ($fallback -ne '2') {
+            Show-AdminConsentInstruction -ClientId $ClientId
+            return $false
+        }
+        Write-RunLog -Severity INFO -Action 'Grant admin consent' -Result 'Opening the Microsoft Graph fallback because it was explicitly selected. Use the same account as Azure CLI so application ownership and billing stay aligned.'
+    }
 
     Write-RunLog -Severity INFO -Action 'Grant admin consent' -Result 'Signing in to Microsoft Graph, in a separate process. Use an account that can administer app registrations; this account is also assigned as the application owner for Azure billing setup.'
     if (-not $script:UseDeviceCode) {
@@ -3718,6 +4042,66 @@ function Write-AzureCliBillingDiagnostic {
     $applicationTenant = if ([string]::IsNullOrWhiteSpace($TenantId)) { '<not supplied>' } else { $TenantId }
     Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
         "Tool=Azure CLI $cliVersion; executable=$($Tool.Detail); graphservices extension=$extensionVersion; subscription=$SubscriptionId; application tenant=$applicationTenant; application=$ClientId; resource=$ResourceGroup/$ResourceName."
+}
+
+function Get-AzureBillingActivityEvidence {
+    <# .SYNOPSIS Reads the failed ARM event for a billing request so Azure support can locate the provider operation. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$ResourceName
+    )
+
+    $resourceId = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.GraphServices/accounts/$ResourceName"
+    $lookupCommand = "az monitor activity-log list --resource-id '$resourceId' --subscription $SubscriptionId --offset 6h --status Failed --max-events 20 --select correlationId eventTimestamp operationId operationName resourceId status subStatus --output json --only-show-errors"
+    try {
+        $output = & az monitor activity-log list --resource-id $resourceId --subscription $SubscriptionId `
+            --offset 6h --status Failed --max-events 20 `
+            --select correlationId eventTimestamp operationId operationName resourceId status subStatus `
+            --output json --only-show-errors 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $message = (("$output" -replace '\s+', ' ').Trim())
+            Write-RunLog -Severity WARN -Action 'Read Azure billing activity' -NoConsole -Result `
+                "The read-only Activity Log query failed: $message Command for support diagnostics: $lookupCommand"
+            return [pscustomobject]@{CorrelationIds = @(); EventCount = 0; LookupCommand = $lookupCommand}
+        }
+
+        $events = @((ConvertFrom-AzureCliJson -Output $output) | Where-Object {
+                [string]::Equals([string](Get-ObjectPropertyValue -InputObject $_ -Names 'resourceId'), $resourceId, [System.StringComparison]::OrdinalIgnoreCase)
+            } | Sort-Object { [string](Get-ObjectPropertyValue -InputObject $_ -Names 'eventTimestamp') } -Descending)
+        if ($events.Count -eq 0) {
+            Write-RunLog -Severity INFO -Action 'Read Azure billing activity' -NoConsole -Result `
+                "No matching failed event is visible yet. Azure Activity Log ingestion can lag. Read-only lookup command: $lookupCommand"
+            return [pscustomobject]@{CorrelationIds = @(); EventCount = 0; LookupCommand = $lookupCommand}
+        }
+
+        $correlationIds = [System.Collections.Generic.List[string]]::new()
+        foreach ($activityEvent in $events) {
+            $correlationId = [string](Get-ObjectPropertyValue -InputObject $activityEvent -Names 'correlationId')
+            $operationId = [string](Get-ObjectPropertyValue -InputObject $activityEvent -Names 'operationId')
+            $timestamp = [string](Get-ObjectPropertyValue -InputObject $activityEvent -Names 'eventTimestamp')
+            $operation = Get-ObjectPropertyValue -InputObject $activityEvent -Names 'operationName'
+            $operationText = [string](Get-ObjectPropertyValue -InputObject $operation -Names 'localizedValue', 'value')
+            $status = Get-ObjectPropertyValue -InputObject $activityEvent -Names 'status'
+            $statusText = [string](Get-ObjectPropertyValue -InputObject $status -Names 'localizedValue', 'value')
+            $subStatus = Get-ObjectPropertyValue -InputObject $activityEvent -Names 'subStatus'
+            $subStatusText = [string](Get-ObjectPropertyValue -InputObject $subStatus -Names 'localizedValue', 'value')
+            if (-not [string]::IsNullOrWhiteSpace($correlationId)) { $correlationIds.Add($correlationId) }
+            Write-RunLog -Severity INFO -Action 'Read Azure billing activity' -NoConsole -Result `
+                "Failed event timestamp=$timestamp; correlationId=$correlationId; operationId=$operationId; operation=$operationText; status=$statusText; subStatus=$subStatusText; resource=$resourceId."
+        }
+        return [pscustomobject]@{
+            CorrelationIds = @($correlationIds | Select-Object -Unique)
+            EventCount = $events.Count
+            LookupCommand = $lookupCommand
+        }
+    }
+    catch {
+        Write-RunLog -Severity WARN -Action 'Read Azure billing activity' -NoConsole -Result `
+            "The read-only Activity Log query could not be processed: $(Get-ErrorText -ErrorRecord $_) Command for support diagnostics: $lookupCommand"
+        return [pscustomobject]@{CorrelationIds = @(); EventCount = 0; LookupCommand = $lookupCommand}
+    }
 }
 
 function Install-AzureCommandLine {
@@ -4649,6 +5033,7 @@ function Set-MeteredBillingLink {
     $script:LastBillingWasServiceFault = $false
     $script:LastBillingWasClientFault = $false
     $script:LastBillingFailureSignature = ''
+    $script:LastBillingCorrelationIds = @()
     try {
         if ($Tool.Kind -eq 'AzureCli') {
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Using the Azure CLI. A browser sign-in may appear if the CLI is not already signed in.'
@@ -4820,6 +5205,24 @@ function Set-MeteredBillingLink {
         $script:LastBillingWasProviderFault = [bool](Test-AzureProviderImplementationFailure -Message $text)
         $script:LastBillingWasClientFault = $false
         $script:LastBillingFailureSignature = Get-FailureSignature -Message $text
+        $diagnostic = Get-AzureFailureDiagnostic -Message $text
+        $directIds = @($diagnostic.Identifiers | ForEach-Object {
+                $match = [regex]::Match($_, '=(?<value>[0-9a-f-]{36})$')
+                if ($match.Success) { $match.Groups['value'].Value }
+            })
+        $activityEvidence = $null
+        if ($Tool.Kind -eq 'AzureCli' -and $script:LastBillingWasServiceFault) {
+            $activityEvidence = Get-AzureBillingActivityEvidence -SubscriptionId $SubscriptionId `
+                -ResourceGroup $ResourceGroup -ResourceName $ResourceName
+        }
+        $activityIds = if ($null -ne $activityEvidence) { @($activityEvidence.CorrelationIds) } else { @() }
+        $allCorrelationIds = @($directIds) + @($activityIds)
+        $script:LastBillingCorrelationIds = @($allCorrelationIds |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+        $codeText = if ($diagnostic.Codes.Count -gt 0) { $diagnostic.Codes -join ' > ' } else { '<none parsed>' }
+        $identifierText = if ($script:LastBillingCorrelationIds.Count -gt 0) { $script:LastBillingCorrelationIds -join ', ' } else { '<none available yet>' }
+        Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+            "Create classification=$(if ($script:LastBillingWasProviderFault) { 'ProviderFault' } elseif ($script:LastBillingWasServiceFault) { 'ServiceFault' } else { 'CallerFault' }); error codes=$codeText; support correlation IDs=$identifierText."
         if ($Quiet) { return $false }
         Add-RunFailure -FilePath '' -Action 'Link metered billing' -Reason $text
         if ($script:LastBillingWasProviderFault) {
@@ -4834,23 +5237,34 @@ function Set-MeteredBillingLink {
             Write-Host '  Azure returned a server-side error while creating the billing resource.' -ForegroundColor Yellow
             Write-Host '  Preflight completed, but it cannot prove Microsoft.GraphServices create backend' -ForegroundColor Gray
             Write-Host '  health. The full error is in the run log, with correlation IDs below if present.' -ForegroundColor Gray
-            if ($script:LastBillingCorrelationIds.Count -gt 0) {
-                Write-Host ''
-                Write-Host '  If it never recovers, raise it with Azure support and quote these correlation IDs:' -ForegroundColor Gray
-                foreach ($id in $script:LastBillingCorrelationIds) { Write-Host "    $id" -ForegroundColor DarkGray }
-            }
+        }
+        if ($script:LastBillingWasServiceFault -and $script:LastBillingCorrelationIds.Count -gt 0) {
+            Write-Host ''
+            Write-Host '  Raise this with Azure support and quote these ARM correlation IDs:' -ForegroundColor Gray
+            foreach ($id in $script:LastBillingCorrelationIds) { Write-Host "    $id" -ForegroundColor DarkGray }
+        }
+        elseif ($script:LastBillingWasServiceFault -and $null -ne $activityEvidence) {
+            Write-Host ''
+            Write-Host '  Azure Activity Log has not exposed a correlation ID yet. It can take a few' -ForegroundColor Gray
+            Write-Host '  minutes to ingest the failed event. This command only reads that evidence:' -ForegroundColor Gray
+            Write-Host "    $($activityEvidence.LookupCommand)" -ForegroundColor DarkGray
         }
         return $false
     }
 }
 
 function Test-MeteredPrerequisite {
-    <# .SYNOPSIS Verifies the Graph module needed to register and consent the metered application. #>
+    <# .SYNOPSIS Verifies one supported route for consenting the metered application. #>
     [CmdletBinding()]
     param()
 
+    if (Get-Command az -CommandType Application -ErrorAction SilentlyContinue) {
+        Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result 'Azure CLI is available, so one tenant-pinned CLI sign-in can be reused for administrator consent and metered billing.'
+        return $true
+    }
+
     $module = 'Microsoft.Graph.Authentication'
-    $purpose = 'for registering an application and granting consent'
+    $purpose = 'as the administrator-consent fallback when Azure CLI is unavailable'
     $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
     if (-not $installed -and (Request-ModuleInstall -Name $module -Purpose $purpose)) {
         $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
@@ -4859,8 +5273,7 @@ function Test-MeteredPrerequisite {
         Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "$module is required $purpose, but installation was declined or failed."
         return $false
     }
-    if (-not (Get-Command az -CommandType Application -ErrorAction SilentlyContinue) -and
-        -not (Get-Module -ListAvailable -Name Az.Resources -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Module -ListAvailable -Name Az.Resources -ErrorAction SilentlyContinue)) {
         Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result 'Azure CLI or Az.Resources will be offered when the billing association is created; neither is required before application registration.'
     }
     return $true
@@ -4914,7 +5327,7 @@ function Invoke-MeteredSetup {
             }) -Default '1'
         if ($choice -eq '5') { return 'Main' }
         if ($choice -eq '2') {
-            $null = Grant-LabelingAdminConsent -ClientId $existing.ClientId -TenantId $existing.TenantId -Confirm:$false
+            $null = Grant-LabelingAdminConsent -ClientId $existing.ClientId -TenantId $existing.TenantId -PreferAzureCli -Confirm:$false
             return 'Main'
         }
         if ($choice -eq '4') {
@@ -4932,7 +5345,7 @@ function Invoke-MeteredSetup {
             return 'Main'
         }
         if ($choice -eq '1') {
-            $null = Read-MeteredBillingSetting -ClientId $existing.ClientId -TenantId $existing.TenantId
+            $null = Read-MeteredBillingSetting -ClientId $existing.ClientId -TenantId $existing.TenantId -Thumbprint $existing.Thumbprint
             return 'Main'
         }
         $replaceChoice = Read-MenuChoice -Title "Remove the old application $($existing.ClientId) from Entra ID once the new one works?" -Options ([ordered]@{
@@ -5000,13 +5413,18 @@ function Invoke-MeteredSetup {
             '2' = 'No, I will grant it in the Entra admin center'
         }) -Default '1'
     if ($consentChoice -eq '1') {
-        $null = Grant-LabelingAdminConsent -ClientId $application.ClientId -TenantId $application.TenantId -Confirm:$false
+            if (-not (Grant-LabelingAdminConsent -ClientId $application.ClientId -TenantId $application.TenantId -PreferAzureCli -Confirm:$false)) {
+                Write-RunLog -Severity WARN -Action 'Metered setup' -Result 'Administrator consent was not completed, so Azure billing was not attempted. The application and certificate are retained for option 3 to finish later.'
+                return 'Main'
+            }
     }
     else {
         Show-AdminConsentInstruction -ClientId $application.ClientId
+            Write-RunLog -Severity INFO -Action 'Metered setup' -Result 'Azure billing was not attempted because administrator consent was deferred. Finish the portal step, then choose option 3 and keep the existing confidential client.'
+            return 'Main'
     }
 
-    if (Read-MeteredBillingSetting -ClientId $application.ClientId -TenantId $application.TenantId) { return 'Main' }
+    if (Read-MeteredBillingSetting -ClientId $application.ClientId -TenantId $application.TenantId -Thumbprint $application.Thumbprint) { return 'Main' }
 
     if ($script:LastBillingWasProviderFault) {
         Write-Host ''
@@ -5045,18 +5463,42 @@ function Connect-AzureCommandLine {
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
+            $existing = Get-AzureCliAccountContext
+            if ($null -ne $existing -and
+                ([string]::IsNullOrWhiteSpace($TenantId) -or
+                    [string]::Equals($existing.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) -and
+                [string]::Equals($existing.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+                Write-RunLog -Severity SUCCESS -Action 'Sign in to Azure' -Result "Reusing the Azure CLI session for $($existing.UserName) in tenant $($existing.TenantId)."
+                return $true
+            }
+            if (-not (Start-IsolatedAzureCliProfile)) { return $false }
+            $configOutput = & az config set core.login_experience_v2=off --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                Write-RunLog -Severity WARN -Action 'Prepare Azure CLI' -Result "The optional Azure CLI subscription-selector setting could not be disabled: $(($configOutput -join ' ').Trim())"
+            }
             Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure CLI sign-in. Use one account that is an owner of the application registration and has Contributor or Owner access to the subscription being billed.'
             $arguments = [System.Collections.Generic.List[string]]::new()
             $arguments.Add('login')
             if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $arguments.Add('--tenant'); $arguments.Add($TenantId) }
+            $arguments.Add('--allow-no-subscriptions')
+            if ($script:UseDeviceCode) { $arguments.Add('--use-device-code') }
             $arguments.Add('--output'); $arguments.Add('none')
             & az @arguments
             $signedIn = ($LASTEXITCODE -eq 0)
             if ($signedIn) {
+                $account = Get-AzureCliAccountContext
+                if ($null -eq $account -or
+                    (-not [string]::IsNullOrWhiteSpace($TenantId) -and
+                        -not [string]::Equals($account.TenantId, $TenantId, [System.StringComparison]::OrdinalIgnoreCase)) -or
+                    -not [string]::Equals($account.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+                    Write-RunLog -Severity WARN -Action 'Sign in to Azure' -Result "Azure CLI did not expose an active account in application tenant $TenantId after sign-in."
+                    Clear-IsolatedAzureCliProfile
+                    return $false
+                }
                 $script:AzureCliSessionOpened = $true
-                $account = & az account show --query 'user.name' --output tsv --only-show-errors 2>$null
-                if ($LASTEXITCODE -eq 0) { $script:AzureCliAccount = "$account".Trim() }
+                $script:AzureCliAccount = $account.UserName
             }
+            else { Clear-IsolatedAzureCliProfile }
             return $signedIn
         }
         Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure sign-in in a separate process. It may appear behind this window.'
@@ -5065,6 +5507,9 @@ function Connect-AzureCommandLine {
         return ($response.Status -in 'SignedIn', 'Reused')
     }
     catch {
+        if (-not [string]::IsNullOrWhiteSpace($script:AzureCliIsolatedConfigDirectory)) {
+            Clear-IsolatedAzureCliProfile
+        }
         Add-RunFailure -FilePath '' -Action 'Sign in to Azure' -Reason (Get-ErrorText -ErrorRecord $_)
         return $false
     }
@@ -5098,27 +5543,7 @@ function Disconnect-AzureSession {
     [CmdletBinding()]
     param()
 
-    if ($script:AzureCliSessionOpened) {
-        try {
-            $arguments = [System.Collections.Generic.List[string]]::new()
-            $arguments.Add('logout')
-            if (-not [string]::IsNullOrWhiteSpace($script:AzureCliAccount)) {
-                $arguments.Add('--username')
-                $arguments.Add($script:AzureCliAccount)
-            }
-            $arguments.Add('--only-show-errors')
-            $output = & az @arguments 2>&1
-            if ($LASTEXITCODE -ne 0) { throw "az logout failed: $(($output -join ' ').Trim())" }
-            Write-RunLog -Severity INFO -Action 'Disconnect Azure CLI' -Result 'The Azure CLI account signed in by this utility was signed out.'
-        }
-        catch {
-            Write-RunLog -Severity WARN -Action 'Disconnect Azure CLI' -Result (Get-ErrorText -ErrorRecord $_)
-        }
-        finally {
-            $script:AzureCliSessionOpened = $false
-            $script:AzureCliAccount = ''
-        }
-    }
+    if (-not [string]::IsNullOrWhiteSpace($script:AzureCliIsolatedConfigDirectory)) { Clear-IsolatedAzureCliProfile }
     if ($script:AzurePowerShellSessionOpened) {
         try {
             $response = Invoke-AzureAction -Action 'SignOut'
@@ -5247,8 +5672,9 @@ function Select-AzureSubscription {
         [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId
     )
 
+    if ($Tool.Kind -eq 'AzureCli' -and -not (Connect-AzureCommandLine -Tool $Tool -TenantId $TenantId)) { return '' }
     $subscriptions = @(Get-AzureSubscriptionList -Tool $Tool)
-    if ($subscriptions.Count -eq 0) {
+    if ($subscriptions.Count -eq 0 -and $Tool.Kind -ne 'AzureCli') {
         Write-RunLog -Severity INFO -Action 'List subscriptions' -Result 'No Azure subscription was visible, which usually means the Azure tooling is not signed in yet.'
         if ((Read-MenuChoice -Title 'Sign in to Azure now so the subscriptions can be listed?' -Options ([ordered]@{'1' = 'Yes, sign in'; '2' = 'No, I will type the subscription ID'}) -Default '1') -eq '1') {
             if (Connect-AzureCommandLine -Tool $Tool -TenantId $TenantId) {
@@ -5471,6 +5897,15 @@ function Resume-PendingBillingLink {
     }
     $tool = Get-AzureResourceTool
     if ($null -eq $tool) { return }
+    if ($tool.Kind -eq 'AzureCli') {
+        $context = Get-AzureCliAccountContext
+        if ($null -eq $context -or
+            -not [string]::Equals($context.TenantId, $pending.TenantId, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals($context.UserType, 'user', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'The pending billing link was not retried automatically because Azure CLI has no matching user session in the application tenant. Main-menu option 3 can open one tenant-pinned sign-in without changing the existing CLI profile.'
+            return
+        }
+    }
 
     Write-RunLog -Severity INFO -Action 'Link metered billing' -Result "A billing link for application $($pending.ClientId) was left unfinished, so it is being retried now."
     if (Set-MeteredBillingLink -ClientId $pending.ClientId -SubscriptionId $pending.SubscriptionId `
@@ -5497,8 +5932,14 @@ function Read-MeteredBillingSetting {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ClientId,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TenantId,
+        [AllowEmptyString()][string]$Thumbprint = ''
     )
+
+    if (-not [string]::IsNullOrWhiteSpace($Thumbprint) -and -not (Test-SigningCertificateAvailable -Thumbprint $Thumbprint)) {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Certificate $Thumbprint is missing from this user's certificate store, so application $ClientId cannot authenticate. The billing command was not attempted. Replace the confidential client or restore its private-key certificate first."
+        return $false
+    }
 
     $tool = Get-AzureResourceTool
     if ($null -eq $tool) {
@@ -5519,20 +5960,42 @@ function Read-MeteredBillingSetting {
     }
     Write-RunLog -Severity INFO -Action 'Link metered billing' -Result "Using $($tool.Kind) ($($tool.Detail))."
 
-    # Azure resolves the application when it creates the billing resource, so a missing service principal must be fixed first.
-    $servicePrincipalState = Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals'
-    if ($servicePrincipalState -eq 'Missing') {
-        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId has no service principal in tenant $TenantId, which means administrator consent has not been granted yet. Azure looks the application up while creating the billing resource, so linking now is likely to fail."
+    if ($tool.Kind -eq 'AzureCli' -and -not (Connect-AzureCommandLine -Tool $tool -TenantId $TenantId)) {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'A tenant-pinned Azure CLI user sign-in is required before application and billing prerequisites can be checked.'
+        return $false
+    }
+
+    # Azure resolves the application during creation, and the client cannot write unless every requested role is consented.
+    $consentState = if ($tool.Kind -eq 'AzureCli') {
+        Get-AzureCliApplicationConsentState -ClientId $ClientId
+    }
+    else {
+        $status = Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals'
+        [pscustomobject]@{Status = if ($status -eq 'Present') { 'Ready' } elseif ($status -eq 'Missing') { 'ConsentMissing' } else { 'Unknown' }; Count = 0; Message = "Microsoft Graph service-principal check returned $status."}
+    }
+    if ($consentState.Status -in 'Unknown', 'ApplicationMissing', 'ApplicationInvalid') {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application prerequisite check failed, so the billing command was not attempted: $($consentState.Message)"
+        return $false
+    }
+    if ($consentState.Status -eq 'ConsentMissing') {
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId does not have complete administrator consent in tenant ${TenantId}: $($consentState.Message)"
         $consentFirst = Read-MenuChoice -Title 'Grant administrator consent first?' -Options ([ordered]@{
                 '1' = 'Yes, grant it now, then link billing'
                 '2' = 'No, return to the main menu'
             }) -Default '1'
         if ($consentFirst -ne '1') { return $false }
-        if (-not (Grant-LabelingAdminConsent -ClientId $ClientId -TenantId $TenantId -Confirm:$false)) { return $false }
-        Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Waiting a few seconds for the new service principal to replicate.'
-        Start-Sleep -Seconds 15
-        if ((Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals') -eq 'Missing') {
-            Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId still has no service principal in tenant $TenantId after consent. The billing command was not attempted."
+        if (-not (Grant-LabelingAdminConsent -ClientId $ClientId -TenantId $TenantId -PreferAzureCli -Confirm:$false)) { return $false }
+            $consentState = if ($tool.Kind -eq 'AzureCli') {
+                Get-AzureCliApplicationConsentState -ClientId $ClientId
+            }
+            else {
+                Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Waiting a few seconds for the new service principal to replicate.'
+                Start-Sleep -Seconds 15
+                $status = Test-ApplicationInDirectory -ClientId $ClientId -TenantId $TenantId -Collection 'servicePrincipals'
+                [pscustomobject]@{Status = if ($status -eq 'Present') { 'Ready' } elseif ($status -eq 'Missing') { 'ConsentMissing' } else { 'Unknown' }; Count = 0; Message = "Microsoft Graph service-principal check returned $status."}
+            }
+            if ($consentState.Status -ne 'Ready') {
+                Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "Application $ClientId still does not have verifiable administrator consent in tenant $TenantId after consent: $($consentState.Message) The billing command was not attempted."
             return $false
         }
     }
