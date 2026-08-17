@@ -2124,8 +2124,7 @@ try {
     if (-not $applicationSurvives) {
         Write-Step -Message 'That script registers its own application, because the one created here is SharePoint-only and is removed when this run ends. Add -KeepApp to hand this one over instead and save a sign-in.'
     }
-    Write-Step -Message 'To relabel on-premises instead, sync this library with the OneDrive client and point the script at the local synced folder.'
-    Write-Step -Message 'To relabel on-premises instead, sync this library with the OneDrive client and point the script at the local synced folder.'
+    Write-Step -Message 'To relabel with the local/UNC/SharePoint Server file path source instead, sync this library with the OneDrive client and point the script at the local synced folder.'
     Write-Host ''
 }
 catch {

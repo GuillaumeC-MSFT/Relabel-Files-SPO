@@ -43,6 +43,10 @@ $script:LogPath = $null
 $script:ReportPath = $null
 $script:ComplianceSessionOpened = $false
 $script:SharePointSessionOpened = $false
+$script:GraphSessionOpened = $false
+$script:AzureCliSessionOpened = $false
+$script:AzureCliAccount = ''
+$script:AzurePowerShellSessionOpened = $false
 $script:CachedLabels = $null
 $script:EmptyInputCount = 0
 $script:Results = [System.Collections.Generic.List[object]]::new()
@@ -470,58 +474,35 @@ function Disconnect-LabelDiscoveryService {
     }
 }
 
-function Install-SharePointModules {
-    <# .SYNOPSIS Checks and offers to install all PowerShell modules needed for SharePoint Online labeling. #>
+function Install-SharePointModule {
+    <# .SYNOPSIS Checks and offers to install PnP.PowerShell for the SharePoint Online source. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param()
 
-    $required = @(
-        @{ Name = 'PnP.PowerShell'; Purpose = 'to connect to SharePoint Online and manage files' }
-        @{ Name = 'ExchangeOnlineManagement'; Purpose = 'to discover sensitivity labels in the tenant' }
-        @{ Name = 'Microsoft.Graph.Authentication'; Purpose = 'to register an application for metered label writes' }
-        @{ Name = 'Az.Accounts'; Purpose = 'to link Azure billing for metered writes' }
-        @{ Name = 'Az.Resources'; Purpose = 'to link Azure billing for metered writes' }
-    )
-
-    $missing = @()
-    foreach ($module in $required) {
-        if (-not (Get-Module -ListAvailable -Name $module.Name -ErrorAction SilentlyContinue)) {
-            $missing += $module
-        }
-    }
-
-    if ($missing.Count -eq 0) {
-        Write-RunLog -Severity SUCCESS -Action 'Check SharePoint modules' -Result 'All required PowerShell modules are installed.'
+    $moduleName = 'PnP.PowerShell'
+    if (Get-Module -ListAvailable -Name $moduleName -ErrorAction SilentlyContinue) {
+        Write-RunLog -Severity SUCCESS -Action 'Check SharePoint module' -Result 'PnP.PowerShell is installed.'
         return $true
     }
 
     Write-Host ''
-    Write-Host '  SharePoint Online labeling requires these PowerShell modules:' -ForegroundColor Gray
-    foreach ($module in $missing) {
-        Write-Host "    • $($module.Name) - $($module.Purpose)" -ForegroundColor Gray
-    }
-    Write-Host ''
-    Write-Host "  $($missing.Count) module$(if ($missing.Count -gt 1) { 's' }) $(if ($missing.Count -gt 1) { 'are' } else { 'is' }) not installed." -ForegroundColor Yellow
-    $choice = Read-MenuChoice -Title "Install $(if ($missing.Count -gt 1) { 'them' } else { 'it' }) now?" -Options ([ordered]@{
-            '1' = "Yes, install $(if ($missing.Count -gt 1) { 'all' } else { 'it' }) from the PowerShell Gallery"
-            '2' = 'No, I will install them myself'
+    Write-Host '  The SharePoint Online source requires PnP.PowerShell to enumerate libraries,' -ForegroundColor Gray
+    Write-Host '  read labels, and call Graph assignSensitivityLabel. Azure and Graph setup' -ForegroundColor Gray
+    Write-Host '  modules are needed only if you choose to enable metered writes later.' -ForegroundColor Gray
+    $choice = Read-MenuChoice -Title 'Install PnP.PowerShell now?' -Options ([ordered]@{
+            '1' = 'Yes, install it from the PowerShell Gallery'
+            '2' = 'No, I will install it myself'
         }) -Default '1'
     if ($choice -ne '1') { return $false }
+    if (-not $PSCmdlet.ShouldProcess($moduleName, 'Install from PowerShell Gallery')) { return $false }
 
-    $allInstalled = $true
-    foreach ($module in $missing) {
-        if (-not $PSCmdlet.ShouldProcess($module.Name, 'Install from PowerShell Gallery')) { continue }
-        Write-RunLog -Severity INFO -Action 'Install module' -Result "Installing $($module.Name) from PowerShell Gallery. This can take a minute."
-        if (Request-ModuleInstall -Name $module.Name -Purpose $module.Purpose -Confirm:$false) {
-            Write-RunLog -Severity SUCCESS -Action 'Install module' -Result "$($module.Name) is installed."
-        }
-        else {
-            Write-RunLog -Severity WARN -Action 'Install module' -Result "$($module.Name) installation was declined or failed."
-            $allInstalled = $false
-        }
+    Write-RunLog -Severity INFO -Action 'Install module' -Result 'Installing PnP.PowerShell from PowerShell Gallery. This can take a minute.'
+    if (Request-ModuleInstall -Name $moduleName -Purpose 'for the SharePoint Online source' -Confirm:$false) {
+        Write-RunLog -Severity SUCCESS -Action 'Install module' -Result 'PnP.PowerShell is installed.'
+        return $true
     }
-
-    return $allInstalled
+    Write-RunLog -Severity WARN -Action 'Install module' -Result 'PnP.PowerShell installation was declined or failed.'
+    return $false
 }
 
 function Install-PurviewClient {
@@ -838,7 +819,7 @@ function Test-SharePointPrerequisite {
         if ($loaded -and [version]$loaded.Version -lt [version]$module.Version) {
             Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "PnP.PowerShell $($loaded.Version) was already loaded in this session, but $($module.Version) is installed. Start a new PowerShell window to pick up the newer one; some features are unavailable in $($loaded.Version)."
         }
-        foreach ($commandName in 'Connect-PnPOnline', 'Disconnect-PnPOnline', 'Get-PnPProperty', 'Get-PnPFolderItem', 'Get-PnPFileSensitivityLabel', 'Get-PnPFile', 'Add-PnPFile') {
+        foreach ($commandName in 'Connect-PnPOnline', 'Disconnect-PnPOnline', 'Get-PnPProperty', 'Get-PnPFolderItem', 'Get-PnPFileSensitivityLabel', 'Add-PnPFileSensitivityLabel') {
             if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
                 throw "PnP.PowerShell $($module.Version) does not provide required command $commandName. Update it with: Update-Module PnP.PowerShell"
             }
@@ -1045,7 +1026,7 @@ function Get-SharePointFileLabel {
 }
 
 function Set-OneSharePointFileLabel {
-    <# .SYNOPSIS Labels a SharePoint file through a local copy, because SharePoint reads the label out of whatever is uploaded. #>
+    <# .SYNOPSIS Applies one sensitivity label to a SharePoint Online file through the metered Graph API, then confirms it. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory)][object]$File,
@@ -1055,54 +1036,23 @@ function Set-OneSharePointFileLabel {
     if (-not $PSCmdlet.ShouldProcess($File.FullName, "Apply sensitivity label $LabelId")) {
         return [pscustomobject]@{Status = 'Skipped'; Comment = 'ShouldProcess declined the operation.'}
     }
+    # This PnP cmdlet calls driveItem/assignSensitivityLabel. The caller categorises any Graph failure.
+    $null = Add-PnPFileSensitivityLabel -Identity $File.FullName -SensitivityLabelId $LabelId -AssignmentMethod Standard -ErrorAction Stop
 
-    $separator = $File.FullName.LastIndexOf('/')
-    if ($separator -lt 1) { throw "The file URL '$($File.FullName)' has no folder to upload back to." }
-    $folderUrl = $File.FullName.Substring(0, $separator)
-    $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelSPO-' + [guid]::NewGuid().ToString('N'))
-    $localPath = Join-Path $workFolder $File.Name
-
-    # The caller categorises failures, so errors are left to propagate unwrapped.
-    try {
-        $null = New-Item -ItemType Directory -Path $workFolder -Force -ErrorAction Stop
-        $null = Invoke-WithTransientRetry -Description 'Download SharePoint file' -Operation {
-            Get-PnPFile -Url $File.FullName -Path $workFolder -Filename $File.Name -AsFile -Force -ErrorAction Stop
-        }
-        if (-not (Test-Path -LiteralPath $localPath)) { throw 'The file did not download, so there was nothing to label.' }
-
-        $labelResult = Set-FileLabel -Path $localPath -LabelId $LabelId -PreserveFileDetails -ErrorAction Stop
-        if ([string]$labelResult.Status -ne 'Success') {
-            return [pscustomobject]@{
-                Status = [string]$labelResult.Status
-                Comment = "The downloaded copy was not labelled, so nothing was uploaded. $([string]$labelResult.Comment)"
-            }
-        }
-
-        $null = Invoke-WithTransientRetry -Description 'Upload labelled file' -Operation {
-            Add-PnPFile -Path $localPath -Folder $folderUrl -ErrorAction Stop
-        }
-    }
-    finally {
-        Remove-Item -LiteralPath $workFolder -Recurse -Force -ErrorAction SilentlyContinue
-        # A blocking full collection after every file dominates the runtime of a large batch, so sweep periodically instead.
-        $script:FilesSinceCollection++
-        if ($script:FilesSinceCollection -ge 50) { Clear-PurviewHandle }
-    }
-
-    # SharePoint extracts the label from the uploaded file asynchronously, so a completed upload is not yet proof.
-    for ($attempt = 1; $attempt -le 6; $attempt++) {
+    # Graph returns 202 Accepted, so a request that did not throw has not necessarily finished.
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
         Start-Sleep -Seconds ($attempt * 2)
         try {
             $applied = Get-SharePointFileLabel -File $File
             if ($applied -and $applied.Id -eq $LabelId.ToString()) {
-                return [pscustomobject]@{Status = 'Success'; Comment = 'Label applied to the uploaded file and confirmed.'}
+                return [pscustomobject]@{Status = 'Success'; Comment = 'Label applied and confirmed on the file.'}
             }
         }
         catch { Write-Verbose "Could not read the label back for $($File.FullName): $($_.Exception.Message)" }
     }
     return [pscustomobject]@{
         Status = 'Unconfirmed'
-        Comment = 'The labelled file uploaded, but SharePoint does not report the label yet. Extraction is asynchronous and the Sensitivity column is documented to lag; if it never appears, confirm the tenant has Set-SPOTenant -EnableAIPIntegration $true and that this file type supports label extraction.'
+        Comment = 'Graph accepted the request but the file does not report the label yet. assignSensitivityLabel is asynchronous, so it may still be processing; if it never appears, check that a confidential client is in use and that its Azure billing link exists.'
     }
 }
 
@@ -1430,7 +1380,7 @@ function Invoke-FileProcessing {
                 if ($category -eq 'Graph metered API not enabled') {
                     Add-FileResult -FilePath $file.FullName -NewLabel $TargetLabel.Name -Outcome 'Failed' -Details $reason
                     Write-RunLog -Severity ERROR -Action 'Apply label' -Result 'Microsoft Graph rejected the assignment with paymentRequired, so the run stopped instead of failing on every remaining file.'
-                    Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'assignSensitivityLabel is billed per call and accepted only from a confidential client. Choose "Enable SharePoint label writing" on the main menu to register one and link an Azure subscription. See https://aka.ms/graph-metered-overview'
+                    Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'assignSensitivityLabel is billed per call and accepted only from a confidential client. Choose "Enable SharePoint Online metered label writing" on the main menu to register one and link an Azure subscription. See https://aka.ms/graph-metered-overview'
                     Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'Microsoft also classes this as a protected API, so access must be requested from them in addition to billing and consent. See https://learn.microsoft.com/graph/metered-api-list'
                     Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'A token issued before the billing link was created is still refused, so start the utility again after linking. At no extra cost: use a Purview auto-labeling policy, or sync the library with OneDrive and run the local source against the synced folder.'
                     return 'Main'
@@ -1727,9 +1677,9 @@ function Restart-InPowerShell7 {
         return $false
     }
 
-    $choice = Read-MenuChoice -Title "Restart this utility in $hostPath so the SharePoint source can be used?" -Options ([ordered]@{
+        $choice = Read-MenuChoice -Title "Restart this utility in $hostPath so the SharePoint Online source can be used?" -Options ([ordered]@{
             '1' = 'Yes, restart now (your authentication will be reused)'
-            '2' = 'No, stay here and choose the local or UNC source'
+            '2' = 'No, stay here and choose the local/on-prem file path source'
         }) -Default '1'
     if ($choice -ne '1') { return $false }
 
@@ -1752,11 +1702,11 @@ function Test-SharePointSourceAvailable {
 
     if ($HostVersion -ge [version]'7.2.0') { return $true }
     Write-RunLog -Severity WARN -Action 'Select source' -Result "The SharePoint Online source needs PnP.PowerShell, which requires PowerShell 7.2 or later. This host is Windows PowerShell $HostVersion."
-    if (-not $NoRelaunch -and (Restart-InPowerShell7)) { return $false }
+    if (-not $NoRelaunch -and (Restart-InPowerShell7 -Source 'SharePoint')) { return $false }
 
     $command = if ([string]::IsNullOrWhiteSpace($script:ScriptPath)) { 'pwsh -File .\Relabel-Files.ps1' } else { "pwsh -File `"$($script:ScriptPath)`"" }
     Write-RunLog -Severity INFO -Action 'Select source' -Result "To use it later, run: $command"
-    Write-RunLog -Severity INFO -Action 'Select source' -Result 'The local or UNC source works in this host and is the better choice for the Purview Information Protection client.'
+    Write-RunLog -Severity INFO -Action 'Select source' -Result 'The local/on-prem file path source works in this host with the Purview Information Protection client.'
     return $false
 }
 
@@ -1965,11 +1915,11 @@ function Invoke-GraphAction {
         return [pscustomobject]@{Status = 'Error'; Message = 'PowerShell 7 is needed to talk to Microsoft Graph separately from PnP.'; Value = ''}
     }
 
-    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelGraph-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelGraph-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $worker = @'
 param([string]$TenantId, [string]$Action, [string]$ArgumentJson, [string]$ScopeList, [switch]$NoPrompt, [switch]$UseDeviceCode)
 $ErrorActionPreference = 'Stop'
-$result = [ordered]@{ Status = 'Error'; Message = ''; Value = ''; Count = 0 }
+$result = [ordered]@{ Status = 'Error'; Message = ''; Value = ''; Count = 0; OpenedSession = $false }
 # The status line alone says nothing; Graph puts the reason in ErrorDetails.
 function Get-Detail { param($Record)
     $text = "$($Record.Exception.Message)"
@@ -1991,6 +1941,7 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $connect.TenantId = $TenantId }
         if ($UseDeviceCode) { $connect.UseDeviceCode = $true }
         Connect-MgGraph @connect
+        $result.OpenedSession = $true
     }
 
     function Get-Value { param($Object, [string]$Name)
@@ -2126,12 +2077,16 @@ catch {
             $other.Add($text)
         }
         if ([string]::IsNullOrWhiteSpace($resultLine)) {
-            return [pscustomobject]@{Status = 'Error'; Message = (@($other) -join ' '); Value = ''; Count = 0}
+            return [pscustomobject]@{Status = 'Error'; Message = (@($other) -join ' '); Value = ''; Count = 0; OpenedSession = $false}
         }
-        return ($resultLine.Substring(7) | ConvertFrom-Json)
+        $response = $resultLine.Substring(7) | ConvertFrom-Json
+        if ($null -ne $response -and $null -ne $response.PSObject.Properties['OpenedSession'] -and [bool]$response.OpenedSession) {
+            $script:GraphSessionOpened = $true
+        }
+        return $response
     }
     catch {
-        return [pscustomobject]@{Status = 'Error'; Message = (Get-ErrorText -ErrorRecord $_); Value = ''; Count = 0}
+        return [pscustomobject]@{Status = 'Error'; Message = (Get-ErrorText -ErrorRecord $_); Value = ''; Count = 0; OpenedSession = $false}
     }
     finally { Remove-Item -LiteralPath $workerPath -Force -ErrorAction SilentlyContinue }
 }
@@ -2469,7 +2424,7 @@ function Read-SharePointTarget {
                 else {
                     # Consent may have opened a Graph session, which makes an authoritative check free at this point.
                     if ((Test-ApplicationInDirectory -ClientId $confidential.ClientId -TenantId $tenantId) -eq 'Missing') {
-                        Write-RunLog -Severity WARN -Action 'Check confidential client' -Result "The directory confirms application $($confidential.ClientId) no longer exists, so the saved confidential client was forgotten. Choose 'Enable SharePoint label writing' to register a new one."
+                        Write-RunLog -Severity WARN -Action 'Check confidential client' -Result "The directory confirms application $($confidential.ClientId) no longer exists, so the saved confidential client was forgotten. Choose 'Enable SharePoint Online metered label writing' to register a new one."
                         Clear-ConfidentialClientConfig
                     }
                     Write-RunLog -Severity WARN -Action 'Check confidential client' -Result 'Falling back to the read-only delegated sign-in for this run.'
@@ -2546,71 +2501,97 @@ function Read-SharePointTarget {
 }
 
 function Read-FileSource {
-    <# .SYNOPSIS Asks where the files are, before any sign-in, so an unusable source costs nothing. #>
+    <# .SYNOPSIS Selects either file-path labeling through the Purview client or native SharePoint Online labeling through Graph. #>
     [CmdletBinding()]
     param()
 
     while ($true) {
         $sourceChoice = Read-MenuChoice -Title 'Where are the files?' -Options ([ordered]@{
-                '1' = 'Local or UNC folder (Purview Information Protection client)'
-                '2' = 'SharePoint Online document library (PowerShell 7, PnP, and Microsoft Graph)'
+                '1' = 'Local/UNC path or mounted SharePoint Server library (Purview client)'
+                '2' = 'SharePoint Online document library (metered Graph API for Apply)'
             }) -Default '1'
-        
+
         if ($sourceChoice -ne '2') {
-            # Local source selected. Ensure Purview client is available.
+            # File-path source selected. This includes SharePoint Server content exposed through a mounted path.
             if (-not (Get-Module -ListAvailable -Name PurviewInformationProtection -ErrorAction SilentlyContinue)) {
                 if (Install-PurviewClient -Confirm:$false) {
-                    # Purview was installed, utility will restart
                     if ($script:RelaunchCompleted) { return 'Local' }
                 }
             }
             return 'Local'
         }
-        
-        # SharePoint source selected. Check PowerShell version first.
-        if ($PSVersionTable.PSVersion -lt [version]'7.2.0') {
-            Write-RunLog -Severity WARN -Action 'Select source' -Result "SharePoint Online labeling requires PowerShell 7.2 or later. This host is Windows PowerShell $($PSVersionTable.PSVersion)."
-            if (Restart-InPowerShell7 -Source 'SharePoint') {
-                return ''  # Restart in progress, will relaunch with -InitialSource SharePoint
-            }
-            Write-RunLog -Severity INFO -Action 'Select source' -Result 'The local or UNC source works in this host and is the better choice for the Purview Information Protection client.'
-            continue  # Ask again, let user pick local source or try PowerShell 7 again
-        }
-        
-        # PowerShell 7+ confirmed. Now ensure SharePoint modules are installed.
-        if (-not (Install-SharePointModules -Confirm:$false)) {
-            Write-RunLog -Severity WARN -Action 'Select source' -Result 'SharePoint Online requires additional PowerShell modules. Cannot proceed without them.'
+
+        if (-not (Test-SharePointSourceAvailable)) {
+            if ($script:RelaunchCompleted) { return '' }
             continue
         }
-        
+        if (-not (Install-SharePointModule -Confirm:$false)) {
+            Write-RunLog -Severity WARN -Action 'Select source' -Result 'SharePoint Online requires PnP.PowerShell. The other source remains available.'
+            continue
+        }
         return 'SharePoint'
     }
 }
 
 function Read-RunMode {
-    <# .SYNOPSIS Chooses dry run or apply. #>
+    <# .SYNOPSIS Chooses dry run or apply, refusing SharePoint Online writes unless the metered API is configured. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][ValidateSet('Local', 'SharePoint')][string]$Source)
+    param(
+        [Parameter(Mandatory)][ValidateSet('Local', 'SharePoint')][string]$Source,
+        [AllowEmptyString()][string]$TenantId = ''
+    )
 
     if ($Source -eq 'SharePoint') {
-        Write-Host ''
-        Write-Host '  Applying a label here downloads each file, labels that copy with the Purview' -ForegroundColor Cyan
-        Write-Host '  client, and uploads it back. SharePoint reads the label out of the file it' -ForegroundColor Cyan
-        Write-Host '  receives, so no metered Graph API, no Azure billing, and no protected-API' -ForegroundColor Cyan
-        Write-Host '  approval is involved, and no file costs anything to label.' -ForegroundColor Cyan
-        Write-Host ''
-        Write-Host '  This needs the Purview Information Protection client installed here and' -ForegroundColor Gray
-        Write-Host '  signed in with Set-Authentication, the tenant opted in with' -ForegroundColor Gray
-        Write-Host '    Set-SPOTenant -EnableAIPIntegration $true' -ForegroundColor DarkGray
-        Write-Host '  and permission to edit the files. Every labelled file gains a new version,' -ForegroundColor Gray
-        Write-Host '  and its Modified By becomes the account running this utility.' -ForegroundColor Gray
-        if ($script:ConnectedAppOnly) {
+        $confidential = Test-ConfidentialClientReady -TenantId $TenantId
+        # Apply needs the connection this run actually holds to be app-only, not merely a configured application.
+        if ($confidential -and $script:ConnectedAppOnly) {
             Write-Host ''
-            Write-Host '  Warning: this run is signed in as an application. Re-uploading a file that a' -ForegroundColor Yellow
-            Write-Host '  label already encrypted is refused for app-only sign-ins, so sign in as' -ForegroundColor Yellow
-            Write-Host '  yourself if any target file is already protected.' -ForegroundColor Yellow
+            Write-Host "  Confidential client $($confidential.ClientId) is configured, so this source can" -ForegroundColor Yellow
+            Write-Host '  call Graph assignSensitivityLabel. Each file is a metered API call billed to' -ForegroundColor Yellow
+            Write-Host '  the linked Azure subscription. Reading and dry runs remain unmetered.' -ForegroundColor Yellow
+            Write-RunLog -Severity INFO -Action 'Choose run mode' -Result "Apply is available through confidential client $($confidential.ClientId) and the metered Graph assignSensitivityLabel API."
+            return (Read-MenuChoice -Title 'Choose run mode.' -Options ([ordered]@{
+                        '1' = 'Dry run (default, no labels changed, nothing billed)'
+                        '2' = 'Apply labels (metered per file)'
+                    }) -Default '1') -eq '1'
         }
-        Write-RunLog -Severity INFO -Action 'Choose run mode' -Result 'SharePoint apply relabels a downloaded copy and uploads it back, so no metered API is involved.'
+
+        Write-Host ''
+        Write-Host '  This SharePoint Online connection is survey-only, so no label is written and' -ForegroundColor Yellow
+        Write-Host '  nothing is billed. SPO writes use Graph assignSensitivityLabel, an advanced' -ForegroundColor Yellow
+        Write-Host '  metered and protected API that accepts confidential clients only.' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  To enable it, register a certificate-based application with application' -ForegroundColor Gray
+        Write-Host '  Files.ReadWrite.All, grant administrator consent and protected-API access,' -ForegroundColor Gray
+        Write-Host '  then associate the application with an Azure subscription by creating a' -ForegroundColor Gray
+        Write-Host '  Microsoft.GraphServices/accounts resource. This utility guides that setup.' -ForegroundColor Gray
+        Write-Host ''
+        Write-Host '  Local paths, UNC shares, and file access to SharePoint Server use the separate' -ForegroundColor Cyan
+        Write-Host '  Purview client path with Set-FileLabel; that path does not call this API.' -ForegroundColor Cyan
+        Write-RunLog -Severity WARN -Action 'Choose run mode' -Result 'SharePoint Online source forced to dry run. Its write path is the metered, protected, confidential-client-only Graph assignSensitivityLabel API.'
+
+        $setupChoice = Read-MenuChoice -Title 'What next?' -Options ([ordered]@{
+                '1' = 'Continue with this dry run (default)'
+                '2' = 'Switch to the local/UNC/SharePoint Server file path source'
+                '3' = 'Register a confidential client and link Azure billing now'
+            }) -Default '1'
+        if ($setupChoice -eq '2') {
+            $script:Source = 'Local'
+            $script:SetupInterrupted = $true
+            return $true
+        }
+        if ($setupChoice -eq '3') {
+            $null = Invoke-MeteredSetup
+            Write-Host ''
+            if ($script:SetupInterrupted) {
+                Write-Host '  Returning to the main menu because setup replaced this run''s SharePoint' -ForegroundColor Yellow
+                Write-Host '  sign-in. Start a new run to connect as the application.' -ForegroundColor Yellow
+            }
+            else {
+                Write-Host '  Setup did not complete, so this run continues as a dry run.' -ForegroundColor Yellow
+            }
+        }
+        return $true
     }
     return (Read-MenuChoice -Title 'Choose run mode.' -Options ([ordered]@{
                 '1' = 'Dry run (default, no labels changed)'
@@ -2681,6 +2662,7 @@ function Read-RunSetting {
 
     $targetPath = ''
     $siteUrl = ''
+    $tenantId = ''
     $clientId = ''
     $libraryTitle = ''
     $libraryUrl = ''
@@ -2688,6 +2670,7 @@ function Read-RunSetting {
         $target = Read-SharePointTarget
         if ($null -eq $target) { return $null }
         $siteUrl = $target.SiteUrl
+        $tenantId = $target.TenantId
         $clientId = $target.ClientId
         $libraryTitle = $target.LibraryTitle
         $libraryUrl = $target.LibraryUrl
@@ -2708,7 +2691,7 @@ function Read-RunSetting {
     $labelChoice = Read-MenuChoice -Title 'Choose the target sensitivity label.' -Options $labelOptions
     $targetLabel = $Labels[[int]$labelChoice - 1]
     Write-RunLog -Severity INFO -Action 'Select sensitivity label' -Result "Selected $($targetLabel.Name); GUID $($targetLabel.Id); priority $($targetLabel.Priority)."
-    $dryRun = Read-RunMode -Source $Source
+    $dryRun = Read-RunMode -Source $Source -TenantId $tenantId
     if ($script:SetupInterrupted) {
         $script:SetupInterrupted = $false
         return $null
@@ -2939,12 +2922,14 @@ function Invoke-BatchRun {
     if ($labels.Count -eq 0) { return 'Main' }
 
     $siteUrl = ''
+    $tenantId = ''
     $libraryTitle = ''
     $root = ''
     if ($source -eq 'SharePoint') {
         $target = Read-SharePointTarget -SkipSubfolder
         if ($null -eq $target) { return 'Main' }
         $siteUrl = $target.SiteUrl
+        $tenantId = $target.TenantId
         $libraryTitle = $target.LibraryTitle
         $root = $target.TargetPath
     }
@@ -2981,13 +2966,11 @@ function Invoke-BatchRun {
     if ($action -eq 'Exit') { return 'Exit' }
     if ($action -ne 'Continue') { return 'Main' }
 
-    $dryRun = Read-RunMode -Source $source
+    $dryRun = Read-RunMode -Source $source -TenantId $tenantId
     if ($script:SetupInterrupted) {
         $script:SetupInterrupted = $false
         return 'Main'
     }
-    # Applying to SharePoint labels a downloaded copy, so the Purview client is needed for both sources.
-    if (-not $dryRun -and $source -eq 'SharePoint' -and -not (Test-PurviewPrerequisite)) { return 'Main' }
     $logFolder = Read-ValueWithDefault -Prompt 'Log/report folder' -Default $PSScriptRoot
     if (-not (Initialize-RunArtifact -Folder $logFolder -Confirm:$false)) { return 'Main' }
 
@@ -3164,7 +3147,7 @@ function Connect-SharePointAppOnly {
             Add-RunFailure -FilePath $SiteUrl -Action 'Connect SharePoint site' -Reason $message
             if ($isMissingApplication) {
                 Write-RunLog -Severity INFO -Action 'App-only sign-in guidance' -Result 'For an app-only sign-in this almost always means administrator consent was never granted. Registering the application creates the application object, but the service principal that app-only authentication needs is only created when an administrator consents to its permissions.'
-                Write-RunLog -Severity INFO -Action 'App-only sign-in guidance' -Result 'Choose "Enable SharePoint label writing" on the main menu, keep the existing application, and accept the offer to grant consent.'
+                Write-RunLog -Severity INFO -Action 'App-only sign-in guidance' -Result 'Choose "Enable SharePoint Online metered label writing" on the main menu, keep the existing application, and accept the offer to grant consent.'
             }
             else {
                 Write-RunLog -Severity INFO -Action 'App-only sign-in guidance' -Result 'App-only access also needs the site to be reachable by the application. Re-run the confidential client setup from the main menu if consent was never granted.'
@@ -3224,6 +3207,50 @@ function Clear-UnusedRelabelCertificate {
         $null = Remove-RelabelCertificate -Thumbprint $thumbprint -Confirm:$false
     }
     $script:CreatedCertificateThumbprints.Clear()
+}
+
+function Clear-RelabelTemporaryArtifact {
+    <# .SYNOPSIS Removes temporary workers and certificate exports whose owning run has ended. #>
+    [CmdletBinding()]
+    param([switch]$IncludeCurrentProcess)
+
+    $temporaryRoot = [System.IO.Path]::GetTempPath()
+    $legacyCutoff = (Get-Date).AddHours(-1)
+    $removed = 0
+    $namePattern = '^(?:RelabelGraph|RelabelAzure|RelabelCert|graphservices)-(?:(?<pid>\d+)-)?[0-9a-f]{32}(?:\.(?:ps1|json))?$'
+    foreach ($candidate in @(Get-ChildItem -LiteralPath $temporaryRoot -Force -ErrorAction SilentlyContinue)) {
+        $nameMatch = [regex]::Match($candidate.Name, $namePattern)
+        if (-not $nameMatch.Success) { continue }
+        $ownerText = [string]$nameMatch.Groups['pid'].Value
+        if ([string]::IsNullOrWhiteSpace($ownerText)) {
+            # Legacy names carry no owner PID, so age is the only safe way to avoid another live run.
+            if ($candidate.LastWriteTime -gt $legacyCutoff) { continue }
+        }
+        else {
+            $ownerPid = 0
+            if (-not [int]::TryParse($ownerText, [ref]$ownerPid)) { continue }
+            if ($ownerPid -eq $PID -and $IncludeCurrentProcess) {
+                # The caller is the final cleanup for this run.
+            }
+            else {
+                try {
+                    $null = Get-Process -Id $ownerPid -ErrorAction Stop
+                    continue
+                }
+                catch { Write-Verbose "Temporary artifact owner process $ownerPid is no longer running." }
+            }
+        }
+        try {
+            Remove-Item -LiteralPath $candidate.FullName -Recurse -Force -ErrorAction Stop
+            $removed++
+        }
+        catch {
+            Write-RunLog -Severity WARN -Action 'Remove temporary artifact' -Result "Could not remove $($candidate.FullName): $(Get-ErrorText -ErrorRecord $_)"
+        }
+    }
+    if ($removed -gt 0) {
+        Write-RunLog -Severity INFO -Action 'Remove temporary artifact' -Result "Removed $removed temporary worker or certificate-export artifact(s) left by completed runs."
+    }
 }
 
 function Clear-OrphanedRelabelCertificate {
@@ -3303,7 +3330,7 @@ function New-ConfidentialLabelingApplication {
     # redundant. They are directed to a temporary folder and deleted, rather than left in Downloads.
     # Registering signs in again, which replaces any SharePoint connection the caller was using.
     $script:SetupInterrupted = $true
-    $certificateOutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelCert-' + [guid]::NewGuid().ToString('N'))
+    $certificateOutPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelCert-' + $PID + '-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $certificateOutPath -Force -ErrorAction Stop
     $registrationName = $ApplicationName
     $registrationStarted = Get-Date
@@ -3478,6 +3505,7 @@ function Disconnect-RelabelGraph {
     if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication -ErrorAction SilentlyContinue)) { return }
     $response = Invoke-GraphAction -Action 'SignOut' -TenantId '' -NoPrompt
     if ($response.Status -eq 'SignedOut') {
+        $script:GraphSessionOpened = $false
         Write-RunLog -Severity INFO -Action 'Disconnect Microsoft Graph' -Result 'Microsoft Graph session signed out.'
     }
 }
@@ -3613,6 +3641,7 @@ function Test-MeteredBillingResource {
     <# .SYNOPSIS Reports whether the billing resource is already present, which a server-side error can still have left behind. #>
     [CmdletBinding()]
     param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$ResourceName,
         [Parameter(Mandatory)][object]$Tool
@@ -3620,7 +3649,8 @@ function Test-MeteredBillingResource {
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
-            $null = & az graph-services account show --resource-group $ResourceGroup --resource-name $ResourceName --only-show-errors 2>&1
+            $null = & az graph-services account show --resource-group $ResourceGroup --resource-name $ResourceName `
+                --subscription $SubscriptionId --only-show-errors 2>&1
             return ($LASTEXITCODE -eq 0)
         }
         return $false
@@ -3642,7 +3672,7 @@ function Set-MeteredBillingResourceDirect {
     )
 
     # Passed as a file because inline JSON is mangled differently by every shell this may run in.
-    $propertiesPath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-' + [guid]::NewGuid().ToString('N') + '.json')
+    $propertiesPath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.json')
     try {
         Set-Content -LiteralPath $propertiesPath -Value ('{"appId":"' + $ClientId + '"}') -Encoding utf8 -ErrorAction Stop
         # These are the only two versions the resource type has, and each reaches a different service code path.
@@ -3667,7 +3697,7 @@ function Invoke-AzureAction {
     [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', 'resultLine', Justification = 'Assigned inside a ForEach-Object block, which runs in this scope.')]
     param(
-        [Parameter(Mandatory)][ValidateSet('ListSubscriptions', 'ListResourceGroups', 'CreateResourceGroup', 'SignIn', 'BillingLink', 'BillingExists')][string]$Action,
+        [Parameter(Mandatory)][ValidateSet('ListSubscriptions', 'ListResourceGroups', 'CreateResourceGroup', 'SignIn', 'SignOut', 'BillingLink', 'BillingExists')][string]$Action,
         [hashtable]$Arguments = @{},
         [AllowEmptyString()][string]$TenantId = ''
     )
@@ -3683,7 +3713,7 @@ function Invoke-AzureAction {
         return [pscustomobject]@{Status = 'Error'; Message = 'PowerShell 7 is needed to talk to Azure separately from PnP.'; Value = @(); Correlation = @()}
     }
 
-    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelAzure-' + [guid]::NewGuid().ToString('N') + '.ps1')
+    $workerPath = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelAzure-' + $PID + '-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $worker = @'
 param([string]$Action, [string]$ArgumentJson, [string]$TenantId)
 $ErrorActionPreference = 'Stop'
@@ -3745,14 +3775,21 @@ try {
     }
     if (-not $accountsImported) { Import-Module Az.Accounts -ErrorAction Stop }
     $context = Get-AzContext -ErrorAction SilentlyContinue
-    if (-not $context -and $Action -ne 'SignIn') { $result.Status = 'NoSession'; throw 'Not signed in to Azure.' }
+    if (-not $context -and $Action -notin 'SignIn', 'SignOut') { $result.Status = 'NoSession'; throw 'Not signed in to Azure.' }
 
     switch ($Action) {
         'SignIn' {
-            $p = @{ ErrorAction = 'Stop' }
-            if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $p.Tenant = $TenantId }
-            $null = Connect-AzAccount @p
-            $result.Status = 'SignedIn'
+            if ($context) { $result.Status = 'Reused' }
+            else {
+                $p = @{ ErrorAction = 'Stop' }
+                if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $p.Tenant = $TenantId }
+                $null = Connect-AzAccount @p
+                $result.Status = 'SignedIn'
+            }
+        }
+        'SignOut' {
+            if ($context) { $null = Disconnect-AzAccount -AzureContext $context -Scope CurrentUser -Confirm:$false -ErrorAction SilentlyContinue }
+            $result.Status = 'SignedOut'
         }
         'ListSubscriptions' {
             $result.Value = @(Get-AzSubscription -ErrorAction Stop | ForEach-Object {
@@ -4156,15 +4193,19 @@ function Set-MeteredBillingLink {
         if ($Tool.Kind -eq 'AzureCli') {
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Using the Azure CLI. A browser sign-in may appear if the CLI is not already signed in.'
             # The graph-services command group ships in the graphservices extension package.
-            $null = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
-            $null = & az account set --subscription $SubscriptionId 2>&1
-            if (Test-MeteredBillingResource -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
+            $extensionOutput = & az extension add --name graphservices --allow-preview true --upgrade --yes --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "az extension add failed: $(($extensionOutput -join ' ').Trim())" }
+            # Every command receives the subscription explicitly, so this utility never changes the
+            # default subscription of an Azure CLI session that was already open.
+            if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
                 Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Billing resource '$ResourceName' already exists in $ResourceGroup, so nothing needed creating."
+                $script:LastBillingWasServiceFault = $false
+                Clear-PendingBillingLink
                 return $true
             }
-            # A subscription cannot hold a resource type until its provider namespace is registered, which is asynchronous.
             Write-RunLog -Severity INFO -Action 'Link metered billing' -Result 'Registering the Microsoft.GraphServices resource provider on that subscription. This can take a minute the first time.'
-            $null = & az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --only-show-errors 2>&1
+            $providerOutput = & az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --wait --only-show-errors 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "az provider register failed: $(($providerOutput -join ' ').Trim())" }
             $output = ''
             $delaySeconds = 15
             $created = $false
@@ -4248,7 +4289,7 @@ function Set-MeteredBillingLink {
     catch {
         $text = Get-GraphErrorText -ErrorRecord $_
         # A server-side failure can still have created the resource, so confirm before reporting a failure.
-        if (Test-MeteredBillingResource -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
+        if (Test-MeteredBillingResource -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -Tool $Tool) {
             Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "Azure reported an error, but billing resource '$ResourceName' exists, so application $ClientId is linked."
             $script:LastBillingWasServiceFault = $false
             Clear-PendingBillingLink
@@ -4276,31 +4317,26 @@ function Set-MeteredBillingLink {
     }
 }
 
-function Test-MeteredPrerequisites {
-    <# .SYNOPSIS Verifies that all modules needed for metered API setup are available. #>
+function Test-MeteredPrerequisite {
+    <# .SYNOPSIS Verifies the Graph module needed to register and consent the metered application. #>
     [CmdletBinding()]
     param()
 
-    $allReady = $true
-    foreach ($module in @('Microsoft.Graph.Authentication', 'Az.Accounts', 'Az.Resources')) {
+    $module = 'Microsoft.Graph.Authentication'
+    $purpose = 'for registering an application and granting consent'
+    $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
+    if (-not $installed -and (Request-ModuleInstall -Name $module -Purpose $purpose)) {
         $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
-        if (-not $installed) {
-            $purpose = switch ($module) {
-                'Microsoft.Graph.Authentication' { 'for registering an application and granting consent' }
-                'Az.Accounts' { 'for linking Azure billing for metered writes' }
-                'Az.Resources' { 'for linking Azure billing for metered writes' }
-                default { 'for the metered API setup' }
-            }
-            if (Request-ModuleInstall -Name $module -Purpose $purpose) {
-                $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
-            }
-            if (-not $installed) {
-                Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "$module is required $purpose, but installation was declined or failed."
-                $allReady = $false
-            }
-        }
     }
-    return $allReady
+    if (-not $installed) {
+        Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "$module is required $purpose, but installation was declined or failed."
+        return $false
+    }
+    if (-not (Get-Command az -CommandType Application -ErrorAction SilentlyContinue) -and
+        -not (Get-Module -ListAvailable -Name Az.Resources -ErrorAction SilentlyContinue)) {
+        Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result 'Azure CLI or Az.Resources will be offered when the billing association is created; neither is required before application registration.'
+    }
+    return $true
 }
 
 function Invoke-MeteredSetup {
@@ -4308,13 +4344,13 @@ function Invoke-MeteredSetup {
     [CmdletBinding()]
     param()
 
-    if (-not (Test-MeteredPrerequisites)) {
+    if (-not (Test-MeteredPrerequisite)) {
         Write-RunLog -Severity ERROR -Action 'Metered setup' -Result 'Required PowerShell modules are not installed. Complete installation and try again.'
         return $false
     }
 
     Write-Host ''
-    Write-Host '  Enable SharePoint label writing' -ForegroundColor Cyan
+    Write-Host '  Enable SharePoint Online metered label writing' -ForegroundColor Cyan
     Write-Host '  Writing a label to SharePoint calls the Graph assignSensitivityLabel API.' -ForegroundColor Gray
     Write-Host '  That API is metered, and Microsoft accepts it only from a confidential client,' -ForegroundColor Gray
     Write-Host '  which means an application that authenticates with a certificate rather than' -ForegroundColor Gray
@@ -4322,7 +4358,7 @@ function Invoke-MeteredSetup {
     Write-Host ''
     Write-Host '    1. Register an application with a certificate in your personal store.' -ForegroundColor Gray
     Write-Host '    2. Grant it administrator consent, which creates its service principal.' -ForegroundColor Gray
-    Write-Host '    3. Link it to an Azure subscription, which is then billed $0.00185 per file.' -ForegroundColor Gray
+    Write-Host '    3. Link it to an Azure subscription, which is then billed per API call.' -ForegroundColor Gray
     Write-Host ''
     Write-Host '  You need: an administrator to consent, an Azure subscription in the same tenant,' -ForegroundColor Yellow
     Write-Host '  and Contributor rights on it. Metered APIs are unavailable in national clouds,' -ForegroundColor Yellow
@@ -4472,16 +4508,30 @@ function Connect-AzureCommandLine {
 
     try {
         if ($Tool.Kind -eq 'AzureCli') {
+            $existingAccount = & az account show --query 'user.name' --output tsv --only-show-errors 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace("$existingAccount")) {
+                $script:AzureCliAccount = "$existingAccount".Trim()
+                Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Reusing the existing Azure CLI sign-in.'
+                return $true
+            }
             Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure CLI sign-in. Use the account that owns the subscription to be billed.'
             $arguments = [System.Collections.Generic.List[string]]::new()
             $arguments.Add('login')
             if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $arguments.Add('--tenant'); $arguments.Add($TenantId) }
             $arguments.Add('--output'); $arguments.Add('none')
             & az @arguments
-            return ($LASTEXITCODE -eq 0)
+            $signedIn = ($LASTEXITCODE -eq 0)
+            if ($signedIn) {
+                $script:AzureCliSessionOpened = $true
+                $account = & az account show --query 'user.name' --output tsv --only-show-errors 2>$null
+                if ($LASTEXITCODE -eq 0) { $script:AzureCliAccount = "$account".Trim() }
+            }
+            return $signedIn
         }
         Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Opening an Azure sign-in in a separate process. It may appear behind this window.'
-        return ((Invoke-AzureAction -Action 'SignIn' -TenantId $TenantId).Status -eq 'SignedIn')
+        $response = Invoke-AzureAction -Action 'SignIn' -TenantId $TenantId
+        if ($response.Status -eq 'SignedIn') { $script:AzurePowerShellSessionOpened = $true }
+        return ($response.Status -in 'SignedIn', 'Reused')
     }
     catch {
         Add-RunFailure -FilePath '' -Action 'Sign in to Azure' -Reason (Get-ErrorText -ErrorRecord $_)
@@ -4502,13 +4552,53 @@ function Invoke-AzureModuleAction {
     if ($response.Status -eq 'NoSession') {
         Write-RunLog -Severity INFO -Action 'Sign in to Azure' -Result 'Azure is not signed in yet. A sign-in window opens now; it may be behind this one.'
         $signIn = Invoke-AzureAction -Action 'SignIn' -TenantId $TenantId
-        if ($signIn.Status -ne 'SignedIn') {
+        if ($signIn.Status -notin 'SignedIn', 'Reused') {
             Add-RunFailure -FilePath '' -Action 'Sign in to Azure' -Reason ([string]$signIn.Message)
             return $response
         }
+        if ($signIn.Status -eq 'SignedIn') { $script:AzurePowerShellSessionOpened = $true }
         $response = Invoke-AzureAction -Action $Action -Arguments $Arguments -TenantId $TenantId
     }
     return $response
+}
+
+function Disconnect-AzureSession {
+    <# .SYNOPSIS Signs out only Azure sessions this utility opened during the current run. #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:AzureCliSessionOpened) {
+        try {
+            $arguments = [System.Collections.Generic.List[string]]::new()
+            $arguments.Add('logout')
+            if (-not [string]::IsNullOrWhiteSpace($script:AzureCliAccount)) {
+                $arguments.Add('--username')
+                $arguments.Add($script:AzureCliAccount)
+            }
+            $arguments.Add('--only-show-errors')
+            $output = & az @arguments 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "az logout failed: $(($output -join ' ').Trim())" }
+            Write-RunLog -Severity INFO -Action 'Disconnect Azure CLI' -Result 'The Azure CLI account signed in by this utility was signed out.'
+        }
+        catch {
+            Write-RunLog -Severity WARN -Action 'Disconnect Azure CLI' -Result (Get-ErrorText -ErrorRecord $_)
+        }
+        finally {
+            $script:AzureCliSessionOpened = $false
+            $script:AzureCliAccount = ''
+        }
+    }
+    if ($script:AzurePowerShellSessionOpened) {
+        try {
+            $response = Invoke-AzureAction -Action 'SignOut'
+            if ($response.Status -ne 'SignedOut') { throw ([string]$response.Message) }
+            Write-RunLog -Severity INFO -Action 'Disconnect Azure PowerShell' -Result 'The Azure PowerShell context opened by this utility was signed out.'
+        }
+        catch {
+            Write-RunLog -Severity WARN -Action 'Disconnect Azure PowerShell' -Result (Get-ErrorText -ErrorRecord $_)
+        }
+        finally { $script:AzurePowerShellSessionOpened = $false }
+    }
 }
 
 function ConvertFrom-AzureCliJson {
@@ -4902,7 +4992,7 @@ function Read-MeteredBillingSetting {
         return (Wait-ForBillingLink -Pending $pending -Tool $tool -FailureCount $failures)
     }
     Write-Host ''
-    Write-Host '  Billing is linked. Applying labels is now offered for the SharePoint source.' -ForegroundColor Green
+    Write-Host '  Billing is linked. Applying labels is now offered for the SharePoint Online source.' -ForegroundColor Green
     Write-Host '  A token issued before the link may still be refused, so if the first apply run' -ForegroundColor Gray
     Write-Host '  reports paymentRequired, start the utility again to obtain a fresh token.' -ForegroundColor Gray
     return $true
@@ -4986,7 +5076,7 @@ function Clear-RelabelRememberedValue {
         }
     }
     $script:RejectedClientIds.Clear()
-    Disconnect-RelabelGraph
+    if ($script:GraphSessionOpened) { Disconnect-RelabelGraph }
     Write-RunLog -Severity INFO -Action 'Forget settings' -Result 'The certificate of any confidential client is still in your personal certificate store, and the applications themselves still exist in Entra ID.'
 }
 
@@ -5078,15 +5168,6 @@ function Invoke-GuidedRun {
         }
         if ($action -eq 'Change') { continue }
 
-        # Applying to SharePoint labels a downloaded copy, so the Purview client is needed for both sources.
-        if (-not $settings.DryRun -and $settings.Source -eq 'SharePoint' -and -not (Test-PurviewPrerequisite)) {
-            if ($script:RelaunchCompleted) { return 'Exit' }
-            $action = Read-PhaseAction -Phase 'Prerequisite check'
-            if ($action -eq 'Exit') { return 'Exit' }
-            if ($action -eq 'Main' -or $action -eq 'Skip') { return 'Main' }
-            continue
-        }
-
         if (-not $settings.DryRun) {
             Show-SettingsSummary -Settings $settings
             $confirm = Read-MenuChoice -Title 'WRITE OPERATION: Apply the selected label to eligible files?' -Options ([ordered]@{
@@ -5145,11 +5226,15 @@ if ($Restarted) {
     Write-Host "  Restarted in PowerShell $($PSVersionTable.PSVersion). The SharePoint Online source is available here." -ForegroundColor Green
 }
 elseif ($PSVersionTable.PSVersion -lt [version]'7.2.0') {
-    Write-Host '  This host relabels local and UNC folders. Choosing the SharePoint source offers to restart in PowerShell 7.' -ForegroundColor Yellow
+    Write-Host '  This host relabels local/UNC paths and mounted SharePoint Server libraries.' -ForegroundColor Yellow
+    Write-Host '  Choosing SharePoint Online offers to restart in PowerShell 7.' -ForegroundColor Yellow
 }
 Write-RunLog -Severity INFO -Action 'Start utility' -Result 'Microsoft Purview file relabeling utility started. No write occurs unless Apply mode is selected and confirmed.' -NoConsole
 Write-RunEnvironment
 Test-DependencyDrift
+# A killed process cannot execute finally, so recover its temporary workers and certificate exports
+# before this run prompts, signs in, or makes a network request.
+Clear-RelabelTemporaryArtifact
 $exitRequested = $false
 try {
     # Asked once, before the menu, so an unreachable source costs no sign-in and the question is not repeated for every run.
@@ -5169,11 +5254,11 @@ try {
     Clear-OrphanedRelabelCertificate
 
     while (-not $exitRequested) {
-        $sourceLabel = if ($script:Source -eq 'SharePoint') { 'SharePoint Online' } else { 'local or UNC folder' }
+        $sourceLabel = if ($script:Source -eq 'SharePoint') { 'SharePoint Online (metered API for Apply)' } else { 'local/UNC/SharePoint Server path (Purview client)' }
         $mainChoice = Read-MenuChoice -Title "Main menu  (files: $sourceLabel)" -Options ([ordered]@{
                 '1' = 'Start a guided run (one label for one folder)'
                 '2' = 'Start a batch run from a CSV (a different label per folder)'
-                '3' = 'Enable SharePoint label writing (confidential client and Azure billing)'
+                '3' = 'Enable SharePoint Online metered label writing (certificate and Azure billing)'
                 '4' = "Change where the files are (currently $sourceLabel)"
                 '5' = 'Forget settings remembered from previous runs (and sign out of Microsoft Graph)'
                 '6' = 'Show current session summary'
@@ -5217,8 +5302,11 @@ finally {
     }
     Disconnect-LabelDiscoveryService
     Disconnect-SharePointSession
+    if ($script:GraphSessionOpened) { Disconnect-RelabelGraph }
+    Disconnect-AzureSession
     # Nothing this run generated is left behind unless the saved client still needs it.
     Clear-UnusedRelabelCertificate
+    Clear-RelabelTemporaryArtifact -IncludeCurrentProcess
     # Swept again by name, because a certificate abandoned earlier in this run was never recorded
     # here, and a restart is not an ending so it keeps its work.
     if (-not $script:RelaunchCompleted) { Clear-OrphanedRelabelCertificate }
