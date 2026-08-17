@@ -470,6 +470,60 @@ function Disconnect-LabelDiscoveryService {
     }
 }
 
+function Install-SharePointModules {
+    <# .SYNOPSIS Checks and offers to install all PowerShell modules needed for SharePoint Online labeling. #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    param()
+
+    $required = @(
+        @{ Name = 'PnP.PowerShell'; Purpose = 'to connect to SharePoint Online and manage files' }
+        @{ Name = 'ExchangeOnlineManagement'; Purpose = 'to discover sensitivity labels in the tenant' }
+        @{ Name = 'Microsoft.Graph.Authentication'; Purpose = 'to register an application for metered label writes' }
+        @{ Name = 'Az.Accounts'; Purpose = 'to link Azure billing for metered writes' }
+        @{ Name = 'Az.Resources'; Purpose = 'to link Azure billing for metered writes' }
+    )
+
+    $missing = @()
+    foreach ($module in $required) {
+        if (-not (Get-Module -ListAvailable -Name $module.Name -ErrorAction SilentlyContinue)) {
+            $missing += $module
+        }
+    }
+
+    if ($missing.Count -eq 0) {
+        Write-RunLog -Severity SUCCESS -Action 'Check SharePoint modules' -Result 'All required PowerShell modules are installed.'
+        return $true
+    }
+
+    Write-Host ''
+    Write-Host '  SharePoint Online labeling requires these PowerShell modules:' -ForegroundColor Gray
+    foreach ($module in $missing) {
+        Write-Host "    • $($module.Name) - $($module.Purpose)" -ForegroundColor Gray
+    }
+    Write-Host ''
+    Write-Host "  $($missing.Count) module$(if ($missing.Count -gt 1) { 's' }) $(if ($missing.Count -gt 1) { 'are' } else { 'is' }) not installed." -ForegroundColor Yellow
+    $choice = Read-MenuChoice -Title "Install $(if ($missing.Count -gt 1) { 'them' } else { 'it' }) now?" -Options ([ordered]@{
+            '1' = "Yes, install $(if ($missing.Count -gt 1) { 'all' } else { 'it' }) from the PowerShell Gallery"
+            '2' = 'No, I will install them myself'
+        }) -Default '1'
+    if ($choice -ne '1') { return $false }
+
+    $allInstalled = $true
+    foreach ($module in $missing) {
+        if (-not $PSCmdlet.ShouldProcess($module.Name, 'Install from PowerShell Gallery')) { continue }
+        Write-RunLog -Severity INFO -Action 'Install module' -Result "Installing $($module.Name) from PowerShell Gallery. This can take a minute."
+        if (Request-ModuleInstall -Name $module.Name -Purpose $module.Purpose -Confirm:$false) {
+            Write-RunLog -Severity SUCCESS -Action 'Install module' -Result "$($module.Name) is installed."
+        }
+        else {
+            Write-RunLog -Severity WARN -Action 'Install module' -Result "$($module.Name) installation was declined or failed."
+            $allInstalled = $false
+        }
+    }
+
+    return $allInstalled
+}
+
 function Install-PurviewClient {
     <# .SYNOPSIS Installs the Purview Information Protection client, which is what actually writes a label to a file. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
@@ -2495,8 +2549,24 @@ function Read-FileSource {
                 '1' = 'Local or UNC folder (Purview Information Protection client)'
                 '2' = 'SharePoint Online document library (PnP PowerShell and Microsoft Graph)'
             }) -Default '1'
-        if ($sourceChoice -ne '2') { return 'Local' }
-        if (Test-SharePointSourceAvailable) { return 'SharePoint' }
+        if ($sourceChoice -ne '2') {
+            # Local source selected. Ensure Purview client is available.
+            if (-not (Get-Module -ListAvailable -Name PurviewInformationProtection -ErrorAction SilentlyContinue)) {
+                if (Install-PurviewClient -Confirm:$false) {
+                    # Purview was installed, utility will restart
+                    if ($script:RelaunchCompleted) { return 'Local' }
+                }
+            }
+            return 'Local'
+        }
+        # SharePoint source selected. Ensure PowerShell modules are available.
+        if (Test-SharePointSourceAvailable) {
+            if (-not (Install-SharePointModules -Confirm:$false)) {
+                Write-RunLog -Severity WARN -Action 'Select source' -Result 'SharePoint Online requires additional PowerShell modules. Cannot proceed without them.'
+                continue
+            }
+            return 'SharePoint'
+        }
         if ($script:RelaunchCompleted) { return '' }
     }
 }
@@ -4190,10 +4260,42 @@ function Set-MeteredBillingLink {
     }
 }
 
+function Test-MeteredPrerequisites {
+    <# .SYNOPSIS Verifies that all modules needed for metered API setup are available. #>
+    [CmdletBinding()]
+    param()
+
+    $allReady = $true
+    foreach ($module in @('Microsoft.Graph.Authentication', 'Az.Accounts', 'Az.Resources')) {
+        $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
+        if (-not $installed) {
+            $purpose = switch ($module) {
+                'Microsoft.Graph.Authentication' { 'for registering an application and granting consent' }
+                'Az.Accounts' { 'for linking Azure billing for metered writes' }
+                'Az.Resources' { 'for linking Azure billing for metered writes' }
+                default { 'for the metered API setup' }
+            }
+            if (Request-ModuleInstall -Name $module -Purpose $purpose) {
+                $installed = Get-Module -ListAvailable -Name $module -ErrorAction SilentlyContinue
+            }
+            if (-not $installed) {
+                Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "$module is required $purpose, but installation was declined or failed."
+                $allReady = $false
+            }
+        }
+    }
+    return $allReady
+}
+
 function Invoke-MeteredSetup {
     <# .SYNOPSIS Guides the one-time setup that lets this utility write SharePoint labels. #>
     [CmdletBinding()]
     param()
+
+    if (-not (Test-MeteredPrerequisites)) {
+        Write-RunLog -Severity ERROR -Action 'Metered setup' -Result 'Required PowerShell modules are not installed. Complete installation and try again.'
+        return $false
+    }
 
     Write-Host ''
     Write-Host '  Enable SharePoint label writing' -ForegroundColor Cyan
