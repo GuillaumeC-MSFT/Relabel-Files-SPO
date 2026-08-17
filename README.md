@@ -13,7 +13,7 @@ The first question of a guided run is where the files are. The two paths use dif
 | Read label | `Get-FileStatus` | `Get-PnPFileSensitivityLabel` |
 | Apply label | `Set-FileLabel -PreserveFileDetails` | `Add-PnPFileSensitivityLabel`, which calls Graph `assignSensitivityLabel` |
 | Sign-in | `Set-Authentication` | Delegated sign-in to survey; certificate-based confidential client to apply |
-| Permissions | File-system access plus Rights Management rights | Delegated SharePoint `AllSites.Read` and Graph `Files.Read.All` to survey; application `Files.ReadWrite.All` to apply |
+| Permissions | File-system access plus Rights Management rights | Delegated SharePoint `AllSites.Read` and Graph `Files.Read.All` to survey; application SharePoint `Sites.Read.All` and Graph `Files.ReadWrite.All` to apply |
 
 These choices deliberately do not share a write implementation. The file-path choice writes the label into the file with the Purview Information Protection client. It covers local and UNC content, a OneDrive-synced library, and SharePoint Server content only when that content is exposed to the machine as a file-system path. It does not call Microsoft Graph, create an Azure billing resource, or incur a metered API charge.
 
@@ -21,7 +21,7 @@ The native SharePoint Online choice does not download files, change their labels
 
 A SharePoint Online library selected by URL is always handled by this native, metered path. The Purview client is used only for files available through a Windows file-system path.
 
-SPO Apply is offered only when this run is connected with the configured certificate-based confidential client. That application needs Graph application permission `Files.ReadWrite.All`, administrator consent, protected-API approval from Microsoft, and an Azure billing association. A normal interactive/public-client connection can still enumerate files, read labels, and run a dry run, but it cannot call the metered API.
+SharePoint Online Apply is offered only when the current connection uses the configured certificate-based confidential client. That application requests SharePoint application permission `Sites.Read.All` and Graph application permission `Files.ReadWrite.All`. Successful writes also require administrator consent, protected-API approval from Microsoft, and an Azure billing association. A delegated public-client connection can still enumerate files, read labels, and run a dry run, but it cannot call the metered API.
 
 ### Cost and client-type limits on the SharePoint Online apply path
 
@@ -29,10 +29,10 @@ The constraints below come from Microsoft's [metered API overview](https://learn
 
 - `assignSensitivityLabel` is **billed by API usage**. One Apply attempt is one metered call; consult Microsoft's metered API list for the current rate. Reading existing labels, enumerating files, and dry runs do not call it.
 - The calling application **must be a confidential client**. Microsoft's wording is "web application, web API, or daemon/service", and "public client applications (desktop and mobile applications) aren't supported". A confidential client is one that can keep a certificate or client secret private. A workstation PowerShell session signing in as *you* cannot, which is why the default sign-in is refused; an application signing in with its own certificate can, which is why the setup below works.
-- The application must be associated with an active Azure subscription by a `Microsoft.GraphServices/accounts` resource. The subscription must be in the application's tenant, and the operator needs Contributor on the subscription and owner rights on the application registration.
+- The application must be associated with an active Azure subscription by a `Microsoft.GraphServices/accounts` resource. The subscription must be in the application's tenant, and the operator needs effective Contributor or Owner access on the subscription plus direct ownership of the application registration.
 - Metered APIs are available only in the Microsoft global environment. Public clients and Azure managed identities are not supported.
 
-Reading labels, enumerating files, and dry runs against SharePoint cost nothing in either configuration. **Until you complete the setup below, no run this utility performs can incur a per-call charge**, because Apply is not offered for the SharePoint Online source at all. Once a usable confidential client is configured, Apply becomes selectable and each eligible file causes one metered API call. Dry run remains the default and a second confirmation is still required.
+Reading labels, enumerating files, and dry runs do not invoke `assignSensitivityLabel` and therefore do not incur its per-call charge; applicable Microsoft 365 and Purview licensing still applies. Before a confidential client is configured, Apply is not offered for the SharePoint Online source. Once the current connection is app-only, Apply becomes selectable and each file that reaches the write step causes one metered API call. The run-mode check does not independently revalidate the billing resource or protected-API approval, so a missing prerequisite is reported as a rejected file operation. Dry run remains the default and a second confirmation is still required.
 
 ### One requirement this utility cannot satisfy for you
 
@@ -40,23 +40,21 @@ Microsoft classes [assignSensitivityLabel](https://learn.microsoft.com/en-us/gra
 
 There is no unmetered alternative **through Graph**. `assignSensitivityLabel` is the only Microsoft Graph API that writes a sensitivity label to a file in SharePoint or OneDrive, and it is available only in the global cloud.
 
-There is, however, a way round it that costs nothing and needs no approval. The Purview Information Protection client writes labels to files on disk, and the OneDrive client syncs a SharePoint library to disk, so labeling a **synced copy** achieves the same result: OneDrive uploads each change straight back to SharePoint. When you choose the local source, the utility reads the OneDrive client's own list of mounted libraries and offers each one as a folder to scan, so there is no path to type and no guessing which folder maps to which library. When the SharePoint source refuses to apply, it offers to switch you to that route directly. A Purview auto-labeling policy is the other no-cost option, and runs service-side with no client at all.
+There is, however, a route that avoids both this metered API and its protected-API approval. The Purview Information Protection client writes labels to files on disk, and the OneDrive client syncs a SharePoint library to disk, so labeling a **synced copy** achieves the same result: OneDrive uploads each change straight back to SharePoint. When you choose the local source, the utility reads the OneDrive client's own list of mounted libraries and offers each one as a folder to scan, so there is no path to type and no guessing which folder maps to which library. When the SharePoint source refuses to apply, it offers to switch you to that route directly. A Purview auto-labeling policy is another service-side route that avoids this API's per-call charge. Existing product and compliance licensing still applies to both alternatives.
 
 ### Temporary artifacts are cleaned up
 
-Every generated certificate is recorded, and on exit the utility deletes each one **except** the credential the saved client still needs. Certificates are matched by both name and creation time, so one that merely shares a name prefix is never touched. PnP's exported copies are written to a temporary folder and deleted immediately. After a user-fixable setup failure, the utility offers to delete the application, remove its certificate, and forget the pending link. The known Microsoft.GraphServices provider implementation fault is different: the valid application, certificate, and exact pending link are retained without a rollback prompt, because registering another application cannot repair Microsoft's provider and would only repeat the same setup.
+Certificates generated during the current run are tracked by thumbprint and registration time, and on exit the utility deletes each one **except** the credential the saved client still needs. Startup and exit also sweep older certificates whose subject contains `Purview File Labeling`, while preserving the saved client's thumbprint. PnP's exported copies are written to a temporary folder and deleted immediately. After a user-fixable setup failure, the utility offers to delete the application, remove its certificate, and forget the pending link. The known Microsoft.GraphServices provider implementation fault is different: the valid application, certificate, and exact pending link are retained without a rollback prompt, because registering another application cannot repair Microsoft's provider and would only repeat the same setup.
 
 ### Enabling the SharePoint Online apply path
 
 Main menu option 3, *Enable SharePoint Online metered label writing*, performs the three steps Microsoft requires:
 
-1. **Registers a confidential client.** It creates an Entra application whose credential is a certificate generated into your personal certificate store (`Cert:\CurrentUser\My`), where Windows protects the private key. PnP also writes exported copies of that certificate; those are directed to a temporary folder and **deleted immediately**, rather than being left in Downloads, because the store already holds the only copy that is needed. If another machine ever needs it, export it from the store deliberately. It requests Graph `Files.ReadWrite.All` and SharePoint `Sites.Read.All`, both application permissions, so **a Global Administrator must consent**. Only the client ID, tenant ID, and certificate thumbprint are remembered, in `PURVIEW_FILE_LABELING_CC_*` environment variables; none of the three is secret, a thumbprint is a public fingerprint, and none of them can authenticate without the private key. The saved tenant ID is checked against the site's tenant on every run, so the application is only ever used in the tenant it belongs to.
-2. **Grants administrator consent**, from inside the utility. Registering creates the *application*; app-only sign-in additionally needs a **service principal** in the tenant, and only consent creates that. Until it exists, sign-in fails with `AADSTS700016: Application ... was not found in the directory`, which reads like the application is missing even though it exists. Rather than sending you to a portal, the utility offers to do it: it signs in to Microsoft Graph as an administrator, creates the service principal, reads the permissions the registration actually asks for, and assigns each one. Permissions already assigned are treated as success, so it is safe to repeat. If you decline, or it fails, it describes the portal path instead. It deliberately does **not** link to the `/adminconsent` endpoint, which requires a registered `redirect_uri` that a certificate-only application does not have and would land on an error page.
-3. **Links Azure billing.** It creates the `Microsoft.GraphServices/accounts` resource that associates the application with the Azure subscription to be charged, per [Microsoft's metered API setup](https://learn.microsoft.com/en-us/graph/metered-api-setup). The utility signs Azure CLI in when needed, lists subscriptions and resource groups as numbered menus, excludes resource groups whose provisioning state is not `Succeeded`, can create a resource group, rejects a subscription from another tenant, registers `Microsoft.GraphServices`, and verifies both Microsoft prerequisites on the operator: application ownership and effective Contributor or Owner access at subscription scope, including inherited and group assignments. It then invokes Microsoft's documented Azure CLI create command exactly once. The step is idempotent: it checks for the resource before creation and uses read-only verification after either a success or an error. If Azure CLI is unavailable, an isolated Az PowerShell route remains available; its expanded resource read-back must pass the same success contract, and it also stops immediately on the known provider implementation fault.
+1. **Registers a confidential client.** It creates an Entra application whose credential is a certificate generated into your personal certificate store (`Cert:\CurrentUser\My`), where Windows protects the private key. PnP also writes exported copies of that certificate; those are directed to a temporary folder and **deleted immediately**, rather than being left in Downloads, because the store already holds the only copy that is needed. If another machine ever needs it, export it from the store deliberately. It requests Graph `Files.ReadWrite.All` and SharePoint `Sites.Read.All`, both application permissions, so a **Global Administrator or Privileged Role Administrator** must grant administrator consent. Only the client ID, tenant ID, and certificate thumbprint are remembered in `PURVIEW_FILE_LABELING_CC_*` environment variables; none is secret or can authenticate without the private key. The saved tenant ID is checked against the site's tenant on every run, so the application is only ever used in the tenant it belongs to.
+2. **Grants administrator consent**, from inside the utility. Registering creates the *application*; app-only sign-in additionally needs a **service principal** in the tenant. During this workflow, the utility creates that service principal as part of the administrator-consent step. Until it exists, sign-in fails with `AADSTS700016: Application ... was not found in the directory`, which reads like the application is missing even though it exists. Rather than sending you to a portal, the utility signs in to Microsoft Graph as an administrator, creates or reads the service principal, reads the permissions the registration actually asks for, and assigns each one. Permissions already assigned are treated as success, so it is safe to repeat. If you decline, or it fails, the utility describes the portal path instead. It deliberately does **not** link to the `/adminconsent` endpoint, which requires a registered `redirect_uri` that a certificate-only application does not have and would land on an error page.
+3. **Links Azure billing.** It creates the `Microsoft.GraphServices/accounts` resource that associates the application with the Azure subscription to be charged, per [Microsoft's metered API setup](https://learn.microsoft.com/en-us/graph/metered-api-setup). The utility signs Azure CLI in when needed, lists subscriptions and resource groups as numbered menus, excludes resource groups whose provisioning state is not `Succeeded`, can create a resource group, rejects a subscription from another tenant, registers `Microsoft.GraphServices`, and verifies both Microsoft prerequisites on the operator: direct ownership of the application and effective Contributor or Owner access at subscription scope, including inherited and group assignments. It then invokes Microsoft's documented Azure CLI create command exactly once. The step is idempotent: it checks for the resource before creation and uses read-only verification after either a success or an error. If Azure CLI is unavailable, an isolated Az PowerShell route remains available; its expanded resource read-back must pass the same success contract, and it also stops immediately on the known provider implementation fault.
 
 The preferred billing route is Azure CLI. After the utility collects and validates the resource group, billing-resource name, subscription ID, and application client ID, it runs Microsoft's documented command with those values:
-
-An exception applies when the documented create command reaches Microsoft.GraphServices and returns the `OpenTelemetry` `TryCreateLogger` type-load failure. That is a provider implementation error, not a subscription, tenant, resource-group, or authorization problem. The CLI path sends no alternate create or deployment after this response. It retains the application, certificate, exact pending link, and full error, suppresses automatic retries of the same signature, and does not suggest re-registration or rollback.
 
 ```powershell
 az graph-services account create --resource-group <resource-group> `
@@ -66,6 +64,8 @@ az graph-services account create --resource-group <resource-group> `
 
 Before that call, the utility installs or upgrades the `graphservices` extension, records the installed extension version, selects the subscription, and registers the `Microsoft.GraphServices` provider with `--wait`. Each step must succeed before resource creation is attempted.
 
+If the documented create command reaches Microsoft.GraphServices and returns the `OpenTelemetry` `TryCreateLogger` type-load failure, the utility treats it as a provider implementation error rather than a subscription, tenant, resource-group, or authorization problem. The CLI path sends no alternate create or deployment after this response. It retains the application, certificate, exact pending link, and full error, suppresses automatic retries of the same signature, and does not suggest re-registration or rollback.
+
 ### Billing preflight and verification
 
 Immediately before it runs `az graph-services account create`, the utility performs a **non-mutating preflight**. It stops before creation, and does not save a retry, when it finds any of these user-fixable conditions:
@@ -73,35 +73,35 @@ Immediately before it runs `az graph-services account create`, the utility perfo
 - The application service principal is definitely missing. The utility offers to grant administrator consent first and verifies that condition again afterwards.
 - The active Azure cloud is not the global `AzureCloud` environment, the subscription is not `Enabled`, or the subscription tenant differs from the Entra application tenant.
 - Azure CLI confirms that the signed-in user is not an owner of the application, or has neither Contributor nor Owner at subscription scope after inherited and group assignments are included. If Azure CLI cannot query either directory relationship, the utility records that it is unverified and lets the documented create command remain authoritative.
-- The selected resource group cannot be read, or `Microsoft.GraphServices` does not finish registering.
+- The selected resource group cannot be read or its provisioning state is not `Succeeded`, or `Microsoft.GraphServices` does not finish registering.
 
 The preflight deliberately does not call `az deployment group validate`; Microsoft does not require that call, and a provider-side validation defect must not prevent the documented create command from being attempted. After creation, the utility follows Microsoft's documented verification sequence with the selected subscription specified explicitly: `az resource list` locates the resource, then `az resource show` must report type `Microsoft.GraphServices/accounts`, location `Global`, the intended `properties.appId`, a nonempty `properties.billingPlanId`, and `properties.provisioningState` equal to `Succeeded`. A token issued before the association may still need to be refreshed.
 
-A confidential client that is configured but not yet consented to does **not** break ordinary use. Before preferring it, the utility checks whether it is actually usable in that tenant; if it is not, it offers to grant consent there and then, and otherwise falls back to the read-only delegated sign-in so the run continues as a survey. Apply is offered only when the connection the run actually holds is app-only, not merely when an application is configured, so it can never be offered for a sign-in that could not write anyway.
+A confidential client that is configured but not yet consented to does **not** break ordinary use. Before preferring it, the utility checks whether it is actually usable in that tenant; if it is not, it offers to grant consent there and then, and otherwise falls back to the read-only delegated sign-in so the run continues as a survey. Apply is offered only when the connection the run actually holds is app-only, not merely when an application is configured. That proves the authentication shape, but the billing resource and protected-API approval can still cause individual write requests to be refused.
 
 ### Sign-ins are reused rather than repeated
 
 Enabling the apply path can involve several different services, so the utility avoids asking for the same identity twice:
 
 - An open **SharePoint** connection is reused when the site and application match, proven with a live call rather than assumed.
-- Every **Microsoft Graph** and **Azure** operation runs in a **separate PowerShell process**. This is not tidiness, it is required. `PnP.PowerShell` ships the `Microsoft.Extensions.*` assemblies at version 8.0, while `Az.Resources` ships the same assemblies at 2.2.0 and `Microsoft.Graph.Authentication` brings its own again. .NET cannot unload an assembly, so whichever binds first wins for the life of the process: run the Azure billing step and a later SharePoint sign-in fails with *"Method 'get_Services' in type Microsoft.Extensions.Logging.LoggingBuilder ... does not have an implementation"*, which looks like an authentication problem and is not. Keeping Az and Graph out of the process that hosts PnP removes that class of failure entirely. Both children reuse their own saved sign-in, so isolation costs no extra prompts.
-- Registering an application announces the window it is about to open, and honours `-DeviceLogin` so it can never hide behind another window.
+- Every operation performed through the **Microsoft.Graph** or **Az PowerShell** modules runs in a **separate PowerShell process**. This is required because `PnP.PowerShell`, `Az.Resources`, and `Microsoft.Graph.Authentication` can load incompatible versions of the same .NET assemblies, and .NET cannot replace an assembly after it has been loaded. Keeping Az and Microsoft.Graph modules out of the process that hosts PnP removes that class of failure. The Azure CLI route is already a separate executable, so the main process invokes it directly; every relevant command receives `--subscription` explicitly and does not change an existing CLI default subscription. The isolated Graph and Az workers reuse their own saved sign-ins, so isolation does not add prompts.
+- Registering an application announces the sign-in it is about to open and honors `-DeviceLogin`, so device-code authentication can be chosen when browser windows are inconvenient.
 - The **Azure** sign-in is reused when a context already exists, and is pinned to the application's tenant so it cannot silently pick an account from a different directory.
 - Discovered **sensitivity labels** are cached for the session, so a second run does not re-query them.
-- [New-LabelTestSite.ps1](New-LabelTestSite.ps1) hands its site, library, and (with `-KeepApp`) its **application** over, so the labeling utility can reuse that sign-in instead of registering another. It also passes the source across, so you are not asked where the files are.
+- [New-LabelTestSite.ps1](New-LabelTestSite.ps1) hands over its site, library, and source. It also hands over an application that survives cleanup: a supplied application automatically, or a generated one when `-KeepApp` is used. A helper-generated application has delegated SharePoint `AllSites.FullControl` but not Graph `Files.Read.All`, so it cannot read existing file labels unless that Graph permission is added and consented; otherwise the labeling utility offers to register its own read-only application.
 
 ### Stale application IDs are removed, not proposed
 
 A remembered application that the tenant no longer has is worse than none, because it is offered as the default. Before proposing one, the utility asks the tenant's device-authorization endpoint whether it is usable, which needs no sign-in and no consent. If the answer is no, it confirms against the directory itself whenever a Graph session is already open, and **clears the remembered value** when absence is confirmed. The one exception is an application registered moments earlier in the same run, which is kept because Entra replication has not caught up yet. Values owned by other tools are reported but never modified.
 
-### How credentials are handled
+### How credentials and identifiers are handled
 
-Nothing secret is ever written to disk or to an environment variable:
+No secret is written to environment variables, logs, or retained certificate-export files. The one intentionally persistent secret is the confidential client's private key in the Windows certificate store:
 
 - The **certificate private key** lives only in `Cert:\CurrentUser\My`, protected by Windows. Exported copies are deleted as soon as registration finishes.
 - **No password, client secret, or token** is collected, stored, or logged. The utility never prompts for one.
-- The values it remembers are a client ID, a tenant ID, a certificate thumbprint, a site URL, and a library name. None identifies a credential, and none can authenticate on its own.
-- Sign-in always happens in Microsoft's own browser or device-code flow, so no credential passes through the script.
+- The values it remembers are a client ID, a tenant ID, a certificate thumbprint, a site URL, and a library name. These are identifiers rather than secrets, and none can authenticate on its own.
+- Interactive user sign-in happens in Microsoft's browser or device-code flow, so no user credential passes through the script. App-only SharePoint sign-in uses the certificate in the Windows store.
 - Run logs and the CSV report record site URLs, tenant IDs, and paths, which is why `.gitignore` keeps them out of the repository.
 
 Afterwards the SharePoint source signs in as the application rather than as you, and the run-mode prompt offers Apply. Three limits are worth knowing before you start:
@@ -114,10 +114,10 @@ Option 3 also lets you re-link billing for an existing application, grant its co
 
 You do not have to find option 3 first: when a SharePoint run is forced to dry run because no confidential client exists, it explains why and **offers to run the setup there and then**. That returns you to the main menu afterwards, because registering the application replaces the sign-in the run was using.
 
-If you would rather not pay per call at all:
+If you would rather not use the metered `assignSensitivityLabel` API:
 
-- A **Microsoft Purview auto-labeling policy** for SharePoint and OneDrive, which labels content at rest as part of the compliance licensing rather than per API call.
-- **Syncing the library with OneDrive** and running this utility's local source against the synced folder. That path uses the Purview Information Protection client and `Set-FileLabel`, never touches Graph, and syncs the labeled files back.
+- A **Microsoft Purview auto-labeling policy** for SharePoint and OneDrive, which labels content at rest under the applicable compliance licensing rather than this API's per-call meter.
+- **Syncing the library with OneDrive** and running this utility's local source against the synced folder. That path uses the Purview Information Protection client and `Set-FileLabel`, avoids Graph metering and protected-API approval, and syncs the labeled files back. Applicable Microsoft 365, Purview, and OneDrive licensing still applies.
 
 The SharePoint source needs PowerShell 7.2 or later, and the local source is most reliable in Windows PowerShell 5.1, so the utility does not force a host on you. Where the files are is asked **before** it signs in to anything, so if you pick SharePoint Online in Windows PowerShell it can offer to restart in the newest installed PowerShell 7 without discarding a Microsoft 365 sign-in. It closes its own connections first, hands over in the same window, and ends when that run ends. The restarted run **carries your source choice with it**, so the question is never asked twice. Answer no to stay where you are and use the local source. `-NoRelaunch` suppresses the offer, and the restarted run always carries it so the handover happens at most once.
 
@@ -133,24 +133,24 @@ The generated non-secret client ID is remembered per tenant, in `PURVIEW_FILE_LA
 
 This read-only application is what the SharePoint source uses by default. If you complete the confidential client setup from main menu option 3, that certificate-based application takes precedence instead **for the tenant it was registered in**, the sign-in becomes app-only, and this prompt no longer appears. Against any other tenant the utility says so and falls back to the delegated application described here. Forgetting the confidential client also returns you to it.
 
-The application that [New-LabelTestSite.ps1](New-LabelTestSite.ps1) creates is **not** reusable here: it holds only SharePoint permissions, and it is deleted at the end of every provisioning run. If that delete is refused, its consent, permissions, redirect URIs, and sign-in are stripped first, so what remains is inert. A name collision is not fatal in either script: the helper registers under a timestamped name, and the labeling utility offers to reuse the existing application, register under a new name, or take an application ID you paste in.
+The application that [New-LabelTestSite.ps1](New-LabelTestSite.ps1) creates is not sufficient for label reading by default: it holds only SharePoint permissions and is deleted at the end of the provisioning run unless `-KeepApp` is used. Keeping it hands its client ID to this utility, but Graph `Files.Read.All` must still be added and consented before it can read existing file labels; otherwise let the labeling utility register its own read-only application. If helper cleanup is refused, its consent, permissions, redirect URIs, and sign-in are stripped first, so what remains is inert. A name collision is not fatal in either script: the helper registers under a timestamped name, and the labeling utility offers to reuse the existing application, register under a new name, or take an application ID you paste in.
 
 Unlike the provisioning helper, this application is kept, because it is what you sign in with. Remove it in the Entra admin center when you no longer need the utility.
 
 ## Prerequisites
 
 - Windows with Windows PowerShell 5.1 (`powershell.exe`) and .NET Framework 4.7.2 or later. PowerShell 7 (`pwsh`) also works; because the Purview client ships .NET Framework assemblies, the utility falls back to `Import-Module -UseWindowsPowerShell` when a native import fails. Use Windows PowerShell 5.1 if the module misbehaves. The SharePoint Online source needs PowerShell 7.2 or later.
-- The Microsoft Purview Information Protection client and `PurviewInformationProtection` PowerShell module installed, for the local and UNC source. **This is the only prerequisite you must install yourself**, because it ships as a client installer rather than a gallery module.
+- The Microsoft Purview Information Protection client and `PurviewInformationProtection` PowerShell module installed for the local and UNC source. The utility cannot install this client automatically because it is distributed as a client installer rather than a PowerShell Gallery module.
 - `PnP.PowerShell`, for the SharePoint Online source.
 - The `ExchangeOnlineManagement` module, used to connect to Security & Compliance PowerShell and retrieve labels with `Get-Label`.
-- Only to apply labels in SharePoint: the **Azure CLI** or the **`Az.Resources`** module, used once to create the billing link, and `Microsoft.Graph.Authentication` to grant consent. None of them is needed to survey. That step also needs an Azure subscription in the same tenant, Contributor rights on it, and an administrator to consent to the application permissions.
+- Only to apply labels in SharePoint: the **Azure CLI** or the **`Az.Resources`** module to create and verify the billing link, and `Microsoft.Graph.Authentication` to grant consent. None of them is needed to survey. That step also needs an Azure subscription in the same tenant, effective Contributor or Owner rights on it, direct ownership of the application, and a Global Administrator or Privileged Role Administrator to grant administrator consent.
 - A Microsoft Entra account with a published sensitivity label policy that includes the labels being applied.
 - Purview permissions that allow the admin to run `Get-Label` in Security & Compliance PowerShell.
 - Read and write access to the target local folder, UNC share, or SharePoint library and its files.
 - Rights Management permissions needed to inspect or replace protection. For protected content outside the operator's normal access, configure the account as a Purview Information Protection super user according to Microsoft guidance.
 - An authenticated module session for the local source. Run `Import-Module PurviewInformationProtection` and `Set-Authentication` before an apply run. The utility verifies authentication with `Get-FileStatus` and offers to re-check; it does not collect credentials or secrets.
 
-The three gallery modules do not have to be installed in advance. When one is missing at the point it is needed, the utility says so and offers to install it for your user account, which requires no administrator. Declining just prints the `Install-Module` command instead.
+The required PowerShell Gallery modules do not have to be installed in advance. When one is missing at the point it is needed, the utility says so and offers to install it for your user account, which requires no administrator. Declining just prints the `Install-Module` command instead.
 
 One upgrade needs a decision from you. PnP.PowerShell moved from a Microsoft signing certificate to the .NET Foundation, and PowerShellGet refuses to install across a publisher change: *"a Microsoft-signed module ... conflicts with the new module ... use -SkipPublisherCheck"*. The utility recognises that error, explains that the check exists to catch a package changing hands unexpectedly, and asks before retrying with `-SkipPublisherCheck`. The default is to stop.
 
@@ -162,7 +162,7 @@ PnP.PowerShell loads .NET assemblies, and .NET cannot unload them. Whichever ver
 
 This is easy to miss, because `Get-Module -ListAvailable` reports only the **newest** version per module; older copies are invisible unless you add `-All`. Both scripts now enumerate with `-All`, warn when more than one version is installed, and `Invoke-PurviewFileLabeling.ps1` offers to uninstall the older ones. That offer only appears in a session that has not yet loaded PnP, since a loaded module cannot be removed.
 
-`Uninstall-Module` only sees modules in the current host's module paths, so a copy installed for the other PowerShell edition — typically under `Documents\WindowsPowerShell\Modules` while you are running PowerShell 7 — cannot be uninstalled that way. When that happens the utility offers to delete the version folder directly instead, and refuses any path that is not a `PnP.PowerShell` version folder. To clean up by hand:
+`Uninstall-Module` only sees modules in the current host's module paths, so a copy installed for the other PowerShell edition — typically under `Documents\WindowsPowerShell\Modules` while you are running PowerShell 7 — cannot be uninstalled that way. When that happens the utility recommends renaming the version folder so PowerShell stops discovering it; immediate deletion is the secondary choice. It refuses any path that is not a `PnP.PowerShell` version folder. To clean up by hand:
 
 ```powershell
 Get-Module -ListAvailable -Name PnP.PowerShell -All | Select-Object Version, ModuleBase
@@ -171,7 +171,7 @@ Uninstall-Module PnP.PowerShell -RequiredVersion <old-version> -Force
 
 Then open a **new** PowerShell window before running either script again.
 
-If the folder cannot be deleted because a file inside it is loaded or access is denied, the utility recommends **renaming** it instead. Renaming the parent does not delete its DLLs, so it often remains possible when deletion is denied, and PowerShell only discovers a module in a folder whose name parses as a version number. A folder renamed to `1.12.0.disabled-<timestamp>` is ignored by future PowerShell processes and can be deleted later. If the current process already loaded an assembly from that folder, it must be closed before the newer PnP version is used; no Windows sign-out or reboot is required. If renaming is also denied, check the folder permissions or security software rather than assuming an editor lock.
+Renaming does not delete the old DLLs, and PowerShell only discovers a module in a folder whose name parses as a version number. A folder renamed to `1.12.0.disabled-<timestamp>` is ignored by future PowerShell processes and can be deleted later. If the current process already loaded an assembly from that folder, it must be closed before the newer PnP version is used; no Windows sign-out or reboot is required. If renaming is denied, check the folder permissions or security software rather than assuming an editor lock.
 
 Install and authentication guidance:
 
@@ -207,40 +207,42 @@ It is intentionally separate from the labeling utility and is not required for n
 
 When provisioning finishes, the helper remembers the site URL and library name it just created in `PURVIEW_FILE_LABELING_SITE_URL` and `PURVIEW_FILE_LABELING_LIBRARY`, so `Invoke-PurviewFileLabeling.ps1` proposes both as defaults: press Enter at the site prompt, and the new library is already the highlighted choice in the library menu.
 
-If `Invoke-PurviewFileLabeling.ps1` sits in the same folder, it also offers to start it for you. That launch is deliberately deferred until **after** the helper's own cleanup has run, so the disposable application is removed before the next sign-in begins. Answer no, or pass `-AcceptDefaults` for an unattended run, and nothing is started.
+If `Invoke-PurviewFileLabeling.ps1` sits in the same folder, the helper also offers to start it. That launch is deliberately deferred until **after** helper cleanup finishes, so a generated application is removed before the next sign-in unless `-KeepApp` was used. Supplied applications are never removed. Answer no, or pass `-AcceptDefaults`, and nothing is started.
 
 ### Working with more than one tenant
 
-Both scripts are tenant-agnostic and remember nothing that could send a later run to the wrong tenant:
+Both scripts support multiple tenants and prevent a tenant-specific application from being silently reused in another tenant:
 
 - The tenant is resolved from the SharePoint address itself, before any sign-in, and passed explicitly to the sign-in. Without that, MSAL reuses whichever account was cached last, which produces a confusing "user account does not exist in this tenant" error when you switch.
 - Application IDs are remembered under a per-tenant name, so an application registered in one tenant is never proposed for another. A value found in a tenant-agnostic variable such as `AZURE_CLIENT_ID` is still offered, but labeled as possibly belonging to another tenant, and registering a fresh one becomes the default.
 - The confidential client records the tenant it was registered in and is skipped, with an explanation, against any other tenant.
 - `New-LabelTestSite.ps1` proposes its remembered root URL as an editable default rather than using it silently, so switching tenants is just typing a different address. `-TenantRootUrl` still overrides it outright.
 
-Nothing tenant-specific is stored in the repository itself; the remembered values live in your own user environment variables. To forget a tenant entirely, clear them:
+Nothing tenant-specific is stored in the repository itself; remembered values live in process- or user-scoped environment variables. Main-menu option 5 discovers and clears every value owned by either script, including tenant-scoped application IDs and the global site and library defaults. To perform the same all-tenant cleanup manually:
 
 ```powershell
-'LABEL_TEST_SITE_TENANT_URL', 'PURVIEW_FILE_LABELING_CLIENT_ID' |
-    ForEach-Object { [Environment]::SetEnvironmentVariable($_, $null, 'User') }
-Get-ChildItem Env: | Where-Object Name -like 'PURVIEW_FILE_LABELING_C*' |
-    ForEach-Object { [Environment]::SetEnvironmentVariable($_.Name, $null, 'User') }
+foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTarget]::User) {
+    [Environment]::GetEnvironmentVariables($target).Keys |
+        Where-Object { $_ -match '^(PURVIEW_FILE_LABELING_|LABEL_TEST_SITE_)' } |
+        ForEach-Object { [Environment]::SetEnvironmentVariable($_, $null, $target) }
+}
 ```
 
 ### Helper behavior and authentication
 
 The helper focuses on validation, not production labeling. It creates a disposable SharePoint site and library so that the label experience can be tested without affecting live content. It is designed to run with as little input as possible: the tenant, admin URL, cloud, and application are discovered automatically, and the validated root URL is remembered in `LABEL_TEST_SITE_TENANT_URL` so later runs need no typed input.
 
-Every prompt proposes a default in brackets that Enter accepts, and every default can also be supplied up front: `-LogFolder`, `-SiteName`, and `-LibraryName`. Pass `-AcceptDefaults` to take every proposed value without being asked.
+Every prompt with a sensible default proposes it in brackets, and values can be supplied up front with `-LogFolder`, `-SiteName`, and `-LibraryName`. Pass `-AcceptDefaults` to take every proposed value without being asked.
 
-Every action is written to a timestamped `New-LabelTestSite-*.log` in the log folder, which defaults to the script directory. The log records the host and account, each resolved value, each prompt and the answer given, every site, folder, and file created, every warning and error, and the outcome of the application cleanup. Lines recorded before the log file exists are buffered and flushed into it, so the log is complete even when the folder is chosen interactively. The log path is printed again on exit.
+The helper writes every action to a timestamped `New-LabelTestSite-*.log` in the log folder, which defaults to the script directory. The log records the host and Windows user, each resolved value, each script prompt and answer, every site, folder, and file created, every warning and error, and the outcome of application cleanup. Lines recorded before the log file exists are buffered and flushed into it, so the log is complete even when the folder is chosen interactively. If the file cannot be created, the helper reports that the run is logged to the console only; otherwise, the log path is printed again on exit.
 
-At most four questions can appear, and all of them can be answered in advance:
+The normal interactive path can ask for these script settings; installation, authentication, and recovery can add their own prompts:
 
 - The log folder, skipped with `-LogFolder` or `-AcceptDefaults`.
-- The SharePoint root URL, skipped when `-TenantRootUrl` is passed, a PnP connection is already open, or `LABEL_TEST_SITE_TENANT_URL` is set. The value can be a full SharePoint URL, an admin or OneDrive host, a `<tenant>.onmicrosoft.com` domain, or just the tenant alias; the scheme is optional.
-- A single confirmation before registering an Entra application, skipped with `-RegisterApp` or `-ClientId`.
-- The site name and document library name, skipped with `-SiteName` and `-LibraryName`, or with `-AcceptDefaults`.
+- The SharePoint root URL. `-TenantRootUrl` supplies it outright; a detected or remembered value is an editable default in an interactive run and is accepted automatically with `-AcceptDefaults`. The value can be a full SharePoint URL, an admin or OneDrive host, a `<tenant>.onmicrosoft.com` domain, or just the tenant alias; the scheme is optional.
+- The application-registration decision, skipped when a usable application is found or when `-RegisterApp` or `-ClientId` supplies the decision.
+- The site name and document library name. `-SiteName` and `-LibraryName` set their proposed values; `-AcceptDefaults` accepts them without prompting.
+- Whether to start `Invoke-PurviewFileLabeling.ps1` after cleanup. `-AcceptDefaults` answers no.
 
 When the host cannot prompt, the helper takes every default and stops immediately if a value it cannot infer is missing, naming the parameter to supply instead of waiting for input. Transient failures such as timeouts, HTTP 429 throttling, and 5xx responses are retried with exponential backoff and honor the server's `Retry-After` header; if the generated site URL is already in use, the next available name is used automatically.
 
@@ -262,7 +264,7 @@ When no usable application is found, the helper offers to run `Register-PnPEntra
 
 ### Removing the application the helper creates
 
-An application the helper registered is removed again on every exit path, including failed runs. An application supplied with `-ClientId`, or found in an environment variable, is never touched. Pass `-KeepApp` to keep a newly created one; the helper then logs its name and client ID so it is not forgotten.
+Unless `-KeepApp` is used, an application the helper registered is removed again on every exit path, including failed runs. An application supplied with `-ClientId`, or found in an environment variable, is never touched. When `-KeepApp` is used, the helper logs the generated application's name and client ID so it is not forgotten.
 
 Deleting an app registration needs Microsoft Graph `Application.ReadWrite.All`, which the helper deliberately does not request for the app it creates. Cleanup therefore tries, in order:
 
@@ -290,11 +292,13 @@ Allow the helper to register the tenant app if needed, then run the same checks:
 
 After preflight succeeds, omit `-PreflightOnly`. A site name is generated automatically unless `-SiteName` is supplied. Device-code authentication remains available with `-AuthMode DeviceCode`; browser authentication is the default.
 
-A fully unattended run supplies the tenant and the application decision up front:
+A run with every script setting accepted up front uses:
 
 ```powershell
 .\New-LabelTestSite.ps1 -TenantRootUrl 'https://contoso.sharepoint.com' -RegisterApp -AcceptDefaults
 ```
+
+This suppresses the helper's setting prompts; Microsoft authentication can still open a browser or device-code flow.
 
 Keep the generated application, write the log elsewhere, and name the site and library explicitly:
 
@@ -303,7 +307,7 @@ Keep the generated application, write the log elsewhere, and name the site and l
     -SiteName 'Label Test March' -LibraryName 'Label Test Library' -LogFolder 'C:\Logs'
 ```
 
-The helper's application has only delegated SharePoint access, so it cannot be reused for the SharePoint source of `Invoke-PurviewFileLabeling.ps1`, and it is deleted when the provisioning run ends. `Invoke-PurviewFileLabeling.ps1` registers its own read-only application, with the Microsoft Graph permission needed to read each file's current label, the first time you use the SharePoint source.
+The helper's generated application has only delegated SharePoint access, so it cannot read file labels in `Invoke-PurviewFileLabeling.ps1` without Graph `Files.Read.All`. It is deleted when provisioning ends unless `-KeepApp` is used. A kept or supplied application is handed over, but the Graph permission must be added and consented before it is sufficient; otherwise the labeling utility offers to register its own read-only application.
 
 ## Run
 
@@ -330,9 +334,9 @@ You are not asked to sign in repeatedly either. Before authenticating, the utili
 
 `New-LabelTestSite.ps1` behaves the same way: a failed sign-in no longer ends the run. It explains the failure — naming the tenant when the application belongs to a different one — and offers to retry with device code, forget the remembered application and register a fresh one for this tenant, enter a different client ID, or stop. `-AuthMode DeviceCode` selects device code from the start.
 
-### Run artifacts contain tenant information
+### Run artifacts may contain tenant information
 
-The log and CSV report record site URLs, tenant IDs, folder paths, and the signed-in account, and both scripts default to writing them **next to the script**, which is this repository. A `.gitignore` excludes the timestamped `Invoke-PurviewFileLabeling-*.log`, `Invoke-PurviewFileLabeling-*.csv`, and `New-LabelTestSite-*.log` names so they can never be committed by accident. Point the log prompt somewhere outside the repository if you would rather keep them further away.
+The labeling CSV records file paths and label outcomes. Run logs can additionally contain site URLs, tenant IDs, and, for the helper, the Windows user and machine name. Both scripts default their artifacts **next to the script**, which is this repository. The `.gitignore` patterns for `Invoke-PurviewFileLabeling-*.log`, `Invoke-PurviewFileLabeling-*.csv`, and `New-LabelTestSite-*.log` reduce the risk of an accidental commit, but do not replace normal review. Choose an output folder outside the repository if you would rather keep the artifacts elsewhere.
 
 No positional parameters are required. **Where the files are is asked once, before the main menu**, so an unreachable source costs no sign-in and the question is not repeated for every run. The menu shows the current choice and option 4 changes it. The guided session then asks, in this order:
 
@@ -352,13 +356,13 @@ Start with a representative dry run and inspect the CSV report. Back up importan
 
 ## Main menu
 
-Everything starts from one menu, and every option returns to it:
+After source selection, the main menu controls the session. Guided and batch runs survey by default and apply only after Apply is selected and confirmed. Most completed actions return to this menu; a clean-exit action ends the session.
 
 | Option | What it does |
 | --- | --- |
-| 1. Guided run | Applies one label to the matching files in one folder or library, optionally including subfolders. |
-| 2. Batch run from a CSV | Applies a different label to the matching files in each listed folder. See below. |
-| 3. Enable SharePoint Online metered label writing | One-time setup that registers a confidential client, grants its administrator consent, and links Azure billing, so the SPO source can apply labels instead of only surveying. Also re-links billing, grants consent for an existing application, replaces it, or forgets it. |
+| 1. Guided run | Surveys or applies one label to the matching files in one folder or library, optionally including subfolders. |
+| 2. Batch run from a CSV | Surveys or applies a different label to the matching files in each listed folder. See below. |
+| 3. Enable SharePoint Online metered label writing | Registers a confidential client, grants its administrator consent, and links Azure billing so the SharePoint Online source can apply labels. Also re-links billing, grants consent for an existing application, replaces it, or forgets it. |
 | 4. Change where the files are | Switches between the local/UNC/SharePoint Server file-path source and native SharePoint Online without restarting. |
 | 5. Forget settings remembered from previous runs | Lists every value this utility remembers, with its scope, and clears them on confirmation. Also signs out of Microsoft Graph, which is otherwise kept so later runs do not prompt. Variables owned by other tools are listed but never modified. |
 | 6. Show current session summary | Totals so far for this session: scanned, labeled, unconfirmed, skipped, failed, and elapsed time. |
@@ -372,7 +376,7 @@ To ignore remembered values for a single run **without deleting anything**, star
 
 That suppresses every remembered application ID, site URL, library, and confidential client, so nothing from an earlier run or a different tenant is proposed as a default. The startup banner says so, and the setting carries across the PowerShell 7 relaunch.
 
-Option 3 changes what the other options can do, and it is the only one that can lead to a charge. It is described in full under [Enabling the SharePoint Online apply path](#enabling-the-sharepoint-online-apply-path). Until you run it, the SharePoint Online source is survey-only and costs nothing.
+Option 3 enables metered writing but does not label files itself. Per-file `assignSensitivityLabel` charges occur only when Apply is selected in a guided or batch run. The setup is described in full under [Enabling the SharePoint Online apply path](#enabling-the-sharepoint-online-apply-path). Until a usable confidential client is configured, the SharePoint Online source remains survey-only; applicable product licensing still applies.
 
 ## Batch runs from a CSV
 
@@ -399,11 +403,11 @@ Rows are processed in the order they appear, and overlapping folders are not det
 
 ## Outputs and Safety
 
-Each run creates timestamped `.log` and `.csv` files. The CSV records every processed file, previous label, requested new label, outcome, and details. The closing summary reports totals scanned, labeled, not confirmed, skipped, failed, and elapsed time.
+Each guided or batch operation creates timestamped `.log` and `.csv` files after its output folder is selected. Merely opening the utility does not create them, and option 3 creates no standalone log when it is used before any guided or batch operation. The CSV records every processed file, previous label, requested new label, outcome, and details. The closing summary reports totals scanned, labeled, not confirmed, skipped, failed, and elapsed time.
 
 For the file-path source, the utility uses `Get-FileStatus` per file and calls `Set-FileLabel -PreserveFileDetails` only after apply mode and explicit confirmation. For SharePoint Online it reads labels with `Get-PnPFileSensitivityLabel`; Apply calls `Add-PnPFileSensitivityLabel`, which submits the metered `assignSensitivityLabel` request. Note the near-identical `Get-PnPFileSensitivityLabelInfo`: despite the more descriptive name it is a SharePoint tenant-admin CSOM call that fails with `Attempted to perform an unauthorized operation` for anyone who is not a SharePoint Administrator, so this utility deliberately does not use it. Failures are collected and reported instead of terminating the whole run. Operator menus allow retry, changed input, skip, main menu, or clean exit. Every session it opens, to Security &amp; Compliance PowerShell or to SharePoint, is closed on exit.
 
-At startup the utility records its version, the host, and the version of every module it can use into the run log, and warns when one is older than expected. A billing attempt additionally records the Azure CLI executable and version, `graphservices` extension version when installed, active cloud, subscription state and tenant, application and application tenant, resource group and location, provider registration state, advertised `Microsoft.GraphServices/accounts` API versions, validation deployment name, requested API version, nested ARM error codes, and tracking or correlation IDs. These diagnostics are log-only so the console stays readable. They contain no password, token, client secret, certificate material, or signed-in account name.
+Startup environment and dependency checks occur before an output folder is chosen, so their messages are not retroactively written to a later run log. When a guided or batch operation has initialized the log, a subsequent Azure CLI billing attempt records the executable and version, `graphservices` extension version, active cloud, subscription state and tenant, application and application tenant, resource-group location and provisioning state, provider registration state, advertised `Microsoft.GraphServices/accounts` API versions, authorization-check outcomes, full Azure errors, and tracking or correlation identifiers when available. These detailed billing diagnostics are log-only so the console stays readable. No password, token, client secret, or certificate material is logged.
 
 PowerShell execution policy may block local scripts. Follow the customer's approved policy; do not weaken organization-wide policy solely to run this utility.
 
