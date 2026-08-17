@@ -11,13 +11,15 @@ The first question of a guided run is where the files are. The two paths use dif
 | Host | Windows PowerShell 5.1 or PowerShell 7 | PowerShell 7.2 or later |
 | Module | `PurviewInformationProtection` | `PnP.PowerShell` |
 | Read label | `Get-FileStatus` | `Get-PnPFileSensitivityLabel` |
-| Apply label | `Set-FileLabel -PreserveFileDetails` | `Add-PnPFileSensitivityLabel`, available only after the confidential client setup below |
-| Sign-in | `Set-Authentication` | Interactive sign-in with an Entra application the utility can register for you, or certificate sign-in as the application itself |
-| Permissions | File-system access plus Rights Management rights | Delegated SharePoint `AllSites.Read` plus Microsoft Graph `Files.Read.All` to survey; application `Files.ReadWrite.All` to apply |
+| Apply label | `Set-FileLabel -PreserveFileDetails` | `Set-FileLabel` on a downloaded copy, uploaded back with `Add-PnPFile` |
+| Sign-in | `Set-Authentication` | Interactive sign-in with an Entra application the utility can register for you |
+| Permissions | File-system access plus Rights Management rights | Delegated SharePoint `AllSites.Read` plus Microsoft Graph `Files.Read.All` to survey; edit rights on the files to apply |
 
-The only way to write a label to SharePoint is the Graph `assignSensitivityLabel` API, which is billed per call and refuses public client applications. An ordinary interactive PowerShell sign-in is a public client, so **by default the SharePoint source surveys only**: it enumerates files and reads their current labels, both of which are free, and the run-mode prompt does not offer Apply. Main menu option 3 lifts that restriction by registering a certificate-based application, which is a confidential client, and linking it to an Azure subscription for billing.
+Writing a label to SharePoint does **not** go through the Graph `assignSensitivityLabel` API. That API is billed per call, refuses public clients, and is a *protected* API that additionally requires a request to Microsoft, so it is not a route a customer can simply switch on. Instead the utility downloads each file, labels that copy with the Purview Information Protection client, and uploads it back. SharePoint extracts the label from the file it receives, which is the same mechanism that makes a OneDrive-synced copy work, and Microsoft documents download-then-upload as the supported way to have SharePoint pick up a label. Nothing is metered, no Azure subscription or billing resource is involved, and no approval is needed.
 
-That API is also asynchronous: it accepts the request and returns before the label is applied, so a call that raises no error has not necessarily changed anything. The read-back verification and the `Not confirmed` outcome exist for that reason.
+Three things are required: the Purview Information Protection client installed on the machine running the utility, the tenant opted in with `Set-SPOTenant -EnableAIPIntegration $true`, and permission to edit the files. Every labelled file gains a new version, and its **Modified By** becomes the account running the utility.
+
+Label extraction is asynchronous: SharePoint accepts the upload before the **Sensitivity** column reflects the new label, so an upload that raises no error has not necessarily finished. The read-back verification and the `Not confirmed` outcome exist for that reason.
 
 ### Cost and client-type limits on the SharePoint apply path
 

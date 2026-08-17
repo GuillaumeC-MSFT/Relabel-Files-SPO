@@ -784,7 +784,7 @@ function Test-SharePointPrerequisite {
         if ($loaded -and [version]$loaded.Version -lt [version]$module.Version) {
             Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "PnP.PowerShell $($loaded.Version) was already loaded in this session, but $($module.Version) is installed. Start a new PowerShell window to pick up the newer one; some features are unavailable in $($loaded.Version)."
         }
-        foreach ($commandName in 'Connect-PnPOnline', 'Disconnect-PnPOnline', 'Get-PnPProperty', 'Get-PnPFolderItem', 'Get-PnPFileSensitivityLabel', 'Add-PnPFileSensitivityLabel') {
+        foreach ($commandName in 'Connect-PnPOnline', 'Disconnect-PnPOnline', 'Get-PnPProperty', 'Get-PnPFolderItem', 'Get-PnPFileSensitivityLabel', 'Get-PnPFile', 'Add-PnPFile') {
             if (-not (Get-Command $commandName -ErrorAction SilentlyContinue)) {
                 throw "PnP.PowerShell $($module.Version) does not provide required command $commandName. Update it with: Update-Module PnP.PowerShell"
             }
@@ -991,7 +991,7 @@ function Get-SharePointFileLabel {
 }
 
 function Set-OneSharePointFileLabel {
-    <# .SYNOPSIS Applies one sensitivity label to a SharePoint file, then confirms the file really carries it. #>
+    <# .SYNOPSIS Labels a SharePoint file through a local copy, because SharePoint reads the label out of whatever is uploaded. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
     param(
         [Parameter(Mandatory)][object]$File,
@@ -1001,23 +1001,54 @@ function Set-OneSharePointFileLabel {
     if (-not $PSCmdlet.ShouldProcess($File.FullName, "Apply sensitivity label $LabelId")) {
         return [pscustomobject]@{Status = 'Skipped'; Comment = 'ShouldProcess declined the operation.'}
     }
-    # The caller categorises failures, so the error is left to propagate unwrapped.
-    $null = Add-PnPFileSensitivityLabel -Identity $File.FullName -SensitivityLabelId $LabelId -AssignmentMethod Standard -ErrorAction Stop
 
-    # Graph accepts assignSensitivityLabel asynchronously, so a call that did not throw has not necessarily applied anything.
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
+    $separator = $File.FullName.LastIndexOf('/')
+    if ($separator -lt 1) { throw "The file URL '$($File.FullName)' has no folder to upload back to." }
+    $folderUrl = $File.FullName.Substring(0, $separator)
+    $workFolder = Join-Path ([System.IO.Path]::GetTempPath()) ('RelabelSPO-' + [guid]::NewGuid().ToString('N'))
+    $localPath = Join-Path $workFolder $File.Name
+
+    # The caller categorises failures, so errors are left to propagate unwrapped.
+    try {
+        $null = New-Item -ItemType Directory -Path $workFolder -Force -ErrorAction Stop
+        $null = Invoke-WithTransientRetry -Description 'Download SharePoint file' -Operation {
+            Get-PnPFile -Url $File.FullName -Path $workFolder -Filename $File.Name -AsFile -Force -ErrorAction Stop
+        }
+        if (-not (Test-Path -LiteralPath $localPath)) { throw 'The file did not download, so there was nothing to label.' }
+
+        $labelResult = Set-FileLabel -Path $localPath -LabelId $LabelId -PreserveFileDetails -ErrorAction Stop
+        if ([string]$labelResult.Status -ne 'Success') {
+            return [pscustomobject]@{
+                Status = [string]$labelResult.Status
+                Comment = "The downloaded copy was not labelled, so nothing was uploaded. $([string]$labelResult.Comment)"
+            }
+        }
+
+        $null = Invoke-WithTransientRetry -Description 'Upload labelled file' -Operation {
+            Add-PnPFile -Path $localPath -Folder $folderUrl -ErrorAction Stop
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $workFolder -Recurse -Force -ErrorAction SilentlyContinue
+        # A blocking full collection after every file dominates the runtime of a large batch, so sweep periodically instead.
+        $script:FilesSinceCollection++
+        if ($script:FilesSinceCollection -ge 50) { Clear-PurviewHandle }
+    }
+
+    # SharePoint extracts the label from the uploaded file asynchronously, so a completed upload is not yet proof.
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
         Start-Sleep -Seconds ($attempt * 2)
         try {
             $applied = Get-SharePointFileLabel -File $File
             if ($applied -and $applied.Id -eq $LabelId.ToString()) {
-                return [pscustomobject]@{Status = 'Success'; Comment = 'Label applied and confirmed on the file.'}
+                return [pscustomobject]@{Status = 'Success'; Comment = 'Label applied to the uploaded file and confirmed.'}
             }
         }
         catch { Write-Verbose "Could not read the label back for $($File.FullName): $($_.Exception.Message)" }
     }
     return [pscustomobject]@{
         Status = 'Unconfirmed'
-        Comment = 'Graph accepted the request but the file does not report the label yet. assignSensitivityLabel is asynchronous, so it may still be processing; if it never appears, check that a confidential client is in use and that its Azure billing link exists.'
+        Comment = 'The labelled file uploaded, but SharePoint does not report the label yet. Extraction is asynchronous and the Sensitivity column is documented to lag; if it never appears, confirm the tenant has Set-SPOTenant -EnableAIPIntegration $true and that this file type supports label extraction.'
     }
 }
 
@@ -2471,78 +2502,29 @@ function Read-FileSource {
 }
 
 function Read-RunMode {
-    <# .SYNOPSIS Chooses dry run or apply, refusing apply where the only write path is billed per call. #>
+    <# .SYNOPSIS Chooses dry run or apply. #>
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][ValidateSet('Local', 'SharePoint')][string]$Source,
-        [AllowEmptyString()][string]$TenantId = ''
-    )
+    param([Parameter(Mandatory)][ValidateSet('Local', 'SharePoint')][string]$Source)
 
     if ($Source -eq 'SharePoint') {
-        $confidential = Test-ConfidentialClientReady -TenantId $TenantId
-        # Apply needs the connection this run actually holds to be app-only, not merely a configured application.
-        if ($confidential -and $script:ConnectedAppOnly) {
+        Write-Host ''
+        Write-Host '  Applying a label here downloads each file, labels that copy with the Purview' -ForegroundColor Cyan
+        Write-Host '  client, and uploads it back. SharePoint reads the label out of the file it' -ForegroundColor Cyan
+        Write-Host '  receives, so no metered Graph API, no Azure billing, and no protected-API' -ForegroundColor Cyan
+        Write-Host '  approval is involved, and no file costs anything to label.' -ForegroundColor Cyan
+        Write-Host ''
+        Write-Host '  This needs the Purview Information Protection client installed here and' -ForegroundColor Gray
+        Write-Host '  signed in with Set-Authentication, the tenant opted in with' -ForegroundColor Gray
+        Write-Host '    Set-SPOTenant -EnableAIPIntegration $true' -ForegroundColor DarkGray
+        Write-Host '  and permission to edit the files. Every labelled file gains a new version,' -ForegroundColor Gray
+        Write-Host '  and its Modified By becomes the account running this utility.' -ForegroundColor Gray
+        if ($script:ConnectedAppOnly) {
             Write-Host ''
-            Write-Host "  Confidential client $($confidential.ClientId) is configured, so this source can" -ForegroundColor Yellow
-            Write-Host '  write labels. Each file costs $0.00185, billed to the linked Azure' -ForegroundColor Yellow
-            Write-Host '  subscription. Reading stays free.' -ForegroundColor Yellow
-            Write-RunLog -Severity INFO -Action 'Choose run mode' -Result "Apply is available through confidential client $($confidential.ClientId)."
-            return (Read-MenuChoice -Title 'Choose run mode.' -Options ([ordered]@{
-                        '1' = 'Dry run (default, no labels changed, nothing billed)'
-                        '2' = 'Apply labels (billed per file)'
-                    }) -Default '1') -eq '1'
+            Write-Host '  Warning: this run is signed in as an application. Re-uploading a file that a' -ForegroundColor Yellow
+            Write-Host '  label already encrypted is refused for app-only sign-ins, so sign in as' -ForegroundColor Yellow
+            Write-Host '  yourself if any target file is already protected.' -ForegroundColor Yellow
         }
-        Write-Host ''
-        Write-Host '  This source surveys only, so no label is written and nothing is billed.' -ForegroundColor Yellow
-        Write-Host '  Writing a label to SharePoint goes through the Graph assignSensitivityLabel' -ForegroundColor Yellow
-        Write-Host '  API, which is billed at $0.00185 per call and accepts confidential client' -ForegroundColor Yellow
-        Write-Host '  applications only.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  A confidential client runs on a server its owner controls, so it can keep a' -ForegroundColor Yellow
-        Write-Host '  certificate or client secret private: a web application, a web API, or a' -ForegroundColor Yellow
-        Write-Host '  daemon such as an Azure Function or a scheduled task signing in as itself,' -ForegroundColor Yellow
-        Write-Host '    Connect-PnPOnline -ClientId <id> -Tenant <tenant> -CertificatePath <pfx>' -ForegroundColor DarkGray
-        Write-Host '  A user can still be signed in to one, which is how a web application works;' -ForegroundColor Yellow
-        Write-Host '  what matters is that the secret stays out of reach. A public client runs on' -ForegroundColor Yellow
-        Write-Host '  a machine its user controls and can hide nothing: desktop and mobile' -ForegroundColor Yellow
-        Write-Host '  applications, and this utility. That is why it cannot apply labels at any' -ForegroundColor Yellow
-        Write-Host '  price. Reading labels stays free.' -ForegroundColor Yellow
-        Write-Host ''
-        Write-Host '  There is a way round this that costs nothing. Sensitivity labels can be' -ForegroundColor Cyan
-        Write-Host '  applied to a synced copy with the Purview client, which needs no metered' -ForegroundColor Cyan
-        Write-Host '  API, no Azure billing, and no protected-API approval. Sync the library in' -ForegroundColor Cyan
-        Write-Host '  the OneDrive client, then choose the local source; this utility lists every' -ForegroundColor Cyan
-        Write-Host '  synced library it finds. A Purview auto-labeling policy is the other' -ForegroundColor Cyan
-        Write-Host '  no-cost option, and runs service-side with no client at all.' -ForegroundColor Cyan
-        Write-RunLog -Severity WARN -Action 'Choose run mode' -Result 'SharePoint source forced to dry run. No confidential client is configured, and its apply path is a metered, confidential-client-only Graph API.'
-
-        $setupChoice = Read-MenuChoice -Title 'What next?' -Options ([ordered]@{
-                '1' = 'Continue with this dry run (default)'
-                '2' = 'Switch to the local source, using a OneDrive-synced copy instead'
-                '3' = 'Register a confidential client and link Azure billing now'
-            }) -Default '1'
-        if ($setupChoice -eq '2') {
-            $script:Source = 'Local'
-            $script:SetupInterrupted = $true
-            Write-Host ''
-            Write-Host '  Switched to the local source. Start a run from the main menu and the' -ForegroundColor Green
-            Write-Host '  synced libraries on this machine are offered as folders to scan.' -ForegroundColor Green
-            return $true
-        }
-        if ($setupChoice -eq '3') {
-            $null = Invoke-MeteredSetup
-            if ($script:SetupInterrupted) {
-                Write-Host ''
-                Write-Host '  Returning to the main menu, because registering the application replaced' -ForegroundColor Yellow
-                Write-Host '  the SharePoint sign-in this run was using. Start a new run to sign in as' -ForegroundColor Yellow
-                Write-Host '  the application and apply labels.' -ForegroundColor Yellow
-            }
-            else {
-                Write-Host ''
-                Write-Host '  Setup did not complete, so this run continues as a dry run.' -ForegroundColor Yellow
-            }
-        }
-        return $true
+        Write-RunLog -Severity INFO -Action 'Choose run mode' -Result 'SharePoint apply relabels a downloaded copy and uploads it back, so no metered API is involved.'
     }
     return (Read-MenuChoice -Title 'Choose run mode.' -Options ([ordered]@{
                 '1' = 'Dry run (default, no labels changed)'
@@ -2613,7 +2595,6 @@ function Read-RunSetting {
 
     $targetPath = ''
     $siteUrl = ''
-    $tenantId = ''
     $clientId = ''
     $libraryTitle = ''
     $libraryUrl = ''
@@ -2621,7 +2602,6 @@ function Read-RunSetting {
         $target = Read-SharePointTarget
         if ($null -eq $target) { return $null }
         $siteUrl = $target.SiteUrl
-        $tenantId = $target.TenantId
         $clientId = $target.ClientId
         $libraryTitle = $target.LibraryTitle
         $libraryUrl = $target.LibraryUrl
@@ -2642,7 +2622,7 @@ function Read-RunSetting {
     $labelChoice = Read-MenuChoice -Title 'Choose the target sensitivity label.' -Options $labelOptions
     $targetLabel = $Labels[[int]$labelChoice - 1]
     Write-RunLog -Severity INFO -Action 'Select sensitivity label' -Result "Selected $($targetLabel.Name); GUID $($targetLabel.Id); priority $($targetLabel.Priority)."
-    $dryRun = Read-RunMode -Source $Source -TenantId $tenantId
+    $dryRun = Read-RunMode -Source $Source
     if ($script:SetupInterrupted) {
         $script:SetupInterrupted = $false
         return $null
@@ -2873,14 +2853,12 @@ function Invoke-BatchRun {
     if ($labels.Count -eq 0) { return 'Main' }
 
     $siteUrl = ''
-    $tenantId = ''
     $libraryTitle = ''
     $root = ''
     if ($source -eq 'SharePoint') {
         $target = Read-SharePointTarget -SkipSubfolder
         if ($null -eq $target) { return 'Main' }
         $siteUrl = $target.SiteUrl
-        $tenantId = $target.TenantId
         $libraryTitle = $target.LibraryTitle
         $root = $target.TargetPath
     }
@@ -2917,11 +2895,13 @@ function Invoke-BatchRun {
     if ($action -eq 'Exit') { return 'Exit' }
     if ($action -ne 'Continue') { return 'Main' }
 
-    $dryRun = Read-RunMode -Source $source -TenantId $tenantId
+    $dryRun = Read-RunMode -Source $source
     if ($script:SetupInterrupted) {
         $script:SetupInterrupted = $false
         return 'Main'
     }
+    # Applying to SharePoint labels a downloaded copy, so the Purview client is needed for both sources.
+    if (-not $dryRun -and $source -eq 'SharePoint' -and -not (Test-PurviewPrerequisite)) { return 'Main' }
     $logFolder = Read-ValueWithDefault -Prompt 'Log/report folder' -Default $PSScriptRoot
     if (-not (Initialize-RunArtifact -Folder $logFolder -Confirm:$false)) { return 'Main' }
 
@@ -3532,6 +3512,13 @@ function Show-MeteredBillingCommand {
     Write-Host "    az graph-services account create --resource-group $groupText --resource-name $nameText --subscription $subscriptionText --location global --app-id $ClientId" -ForegroundColor DarkGray
     Write-Host '    az resource list --resource-type Microsoft.GraphServices/accounts' -ForegroundColor DarkGray
     Write-Host ''
+    Write-Host '  The preview extension is not the only route. If the create above returns' -ForegroundColor Cyan
+    Write-Host '  InternalServerError, this one uses no extension and names the API version.' -ForegroundColor Cyan
+    Write-Host '  Run it in Bash, which quotes the JSON most reliably:' -ForegroundColor Cyan
+    Write-Host "    az resource create --subscription $subscriptionText --resource-group $groupText --name $nameText --resource-type Microsoft.GraphServices/accounts --api-version 2023-04-13 --location global --properties '{`"appId`":`"$ClientId`"}'" -ForegroundColor DarkGray
+    Write-Host '  If that is refused too, repeat it with --api-version 2022-09-22-preview,' -ForegroundColor Cyan
+    Write-Host '  which is the only other version this resource type has.' -ForegroundColor Cyan
+    Write-Host ''
     Write-Host '  The resource group must already exist, you need Contributor on the subscription,' -ForegroundColor Gray
     Write-Host '  and owner rights on the application registration.' -ForegroundColor Gray
 }
@@ -3556,6 +3543,37 @@ function Test-MeteredBillingResource {
         Write-Verbose "Billing resource lookup reported: $($_.Exception.Message)"
         return $false
     }
+}
+
+function Set-MeteredBillingResourceDirect {
+    <# .SYNOPSIS Creates the billing resource through generic ARM, which needs no preview extension and can name the API version. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$ResourceName,
+        [Parameter(Mandatory)][string]$ClientId
+    )
+
+    # Passed as a file because inline JSON is mangled differently by every shell this may run in.
+    $propertiesPath = Join-Path ([System.IO.Path]::GetTempPath()) ('graphservices-' + [guid]::NewGuid().ToString('N') + '.json')
+    try {
+        Set-Content -LiteralPath $propertiesPath -Value ('{"appId":"' + $ClientId + '"}') -Encoding utf8 -ErrorAction Stop
+        # These are the only two versions the resource type has, and each reaches a different service code path.
+        foreach ($apiVersion in '2023-04-13', '2022-09-22-preview') {
+            Write-RunLog -Severity INFO -Action 'Link metered billing' -Result "Trying the generic ARM route on API version $apiVersion, which does not involve the preview extension."
+            $output = & az resource create --subscription $SubscriptionId --resource-group $ResourceGroup --name $ResourceName `
+                --resource-type 'Microsoft.GraphServices/accounts' --api-version $apiVersion --location global `
+                --properties "@$propertiesPath" --only-show-errors 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                Write-RunLog -Severity SUCCESS -Action 'Link metered billing' -Result "The generic ARM route succeeded on API version $apiVersion."
+                return $true
+            }
+            Write-RunLog -Severity WARN -Action 'Link metered billing' -Result "API version $apiVersion was refused: $(("$output" -replace '\s+', ' ').Trim())"
+        }
+        return $false
+    }
+    finally { Remove-Item -LiteralPath $propertiesPath -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-AzureAction {
@@ -3724,13 +3742,16 @@ try {
             $routes += @{ Kind = 'Cmdlet'; Api = $ordered[0] }
             $routes += @{ Kind = 'Rest'; Api = $ordered[0] }
             $routes += @{ Kind = 'Template'; Api = $ordered[0] }
+            # Each API version reaches a different service code path, so a fault on one is not a fault on all.
             foreach ($v in @($ordered | Select-Object -Skip 1 -First 2)) {
                 $routes += @{ Kind = 'Cmdlet'; Api = $v }
                 $routes += @{ Kind = 'Rest'; Api = $v }
+                $routes += @{ Kind = 'Template'; Api = $v }
             }
 
             $signatures = [System.Collections.Generic.HashSet[string]]::new()
             $kinds = [System.Collections.Generic.HashSet[string]]::new()
+            $apis = [System.Collections.Generic.HashSet[string]]::new()
             $correlation = [System.Collections.Generic.List[string]]::new()
             $created = $false
             $last = ''
@@ -3771,6 +3792,7 @@ try {
                     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $last = "$($_.ErrorDetails.Message) $last" }
                     $null = Add-Signature -Set $signatures -Signature (Get-Signature -Text $last)
                     $null = $kinds.Add([string]$route.Kind)
+                    $null = $apis.Add([string]$route.Api)
                     foreach ($m in [regex]::Matches($last, '(?i)CorrelationId:\s*(?<id>[0-9a-f-]{36})')) { $null = $correlation.Add($m.Groups['id'].Value) }
                     if (Test-Exists) { $created = $true; break }
 
@@ -3786,8 +3808,8 @@ try {
                         'PROGRESS:That failure came from loading the Azure module here, not from Azure.'
                         break
                     }
-                    if ($kinds.Count -ge 3 -and $signatures.Count -eq 1) {
-                        'PROGRESS:Every route returned the same fault, so the provider itself is refusing. Stopping.'
+                    if ($kinds.Count -ge 3 -and $apis.Count -ge 2 -and $signatures.Count -eq 1) {
+                        'PROGRESS:Every route on every API version returned the same fault, so the provider itself is refusing. Stopping.'
                         break
                     }
                     Start-Sleep -Seconds 5
@@ -4059,9 +4081,10 @@ function Set-MeteredBillingLink {
             $null = & az provider register --namespace Microsoft.GraphServices --subscription $SubscriptionId --only-show-errors 2>&1
             $output = ''
             $delaySeconds = 15
-            for ($attempt = 1; $attempt -le 4; $attempt++) {
+            $created = $false
+            for ($attempt = 1; $attempt -le 4 -and -not $created; $attempt++) {
                 $output = & az graph-services account create --resource-group $ResourceGroup --resource-name $ResourceName --subscription $SubscriptionId --location global --app-id $ClientId 2>&1
-                if ($LASTEXITCODE -eq 0) { break }
+                if ($LASTEXITCODE -eq 0) { $created = $true; break }
                 $propagating = "$output" -match '(?i)MissingSubscriptionRegistration|not registered to use namespace'
                 if ($attempt -lt 4 -and ($propagating -or (Test-AzureServiceFailure -Message "$output"))) {
                     $reason = if ($propagating) { 'The Microsoft.GraphServices registration is still propagating.' } else { 'Azure returned a server-side error.' }
@@ -4070,8 +4093,12 @@ function Set-MeteredBillingLink {
                     $delaySeconds = [math]::Min($delaySeconds * 2, 60)
                     continue
                 }
-                throw "az graph-services account create failed: $($output -join ' ')"
+                break
             }
+            if (-not $created) {
+                $created = Set-MeteredBillingResourceDirect -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -ResourceName $ResourceName -ClientId $ClientId
+            }
+            if (-not $created) { throw "az graph-services account create failed: $($output -join ' ')" }
         }
         else {
             if (-not (Get-Module -ListAvailable -Name Az.Resources -ErrorAction SilentlyContinue)) { throw 'Az.Resources is not available.' }
@@ -4932,6 +4959,15 @@ function Invoke-GuidedRun {
             if ($action -eq 'Change') { break }
         }
         if ($action -eq 'Change') { continue }
+
+        # Applying to SharePoint labels a downloaded copy, so the Purview client is needed for both sources.
+        if (-not $settings.DryRun -and $settings.Source -eq 'SharePoint' -and -not (Test-PurviewPrerequisite)) {
+            if ($script:RelaunchCompleted) { return 'Exit' }
+            $action = Read-PhaseAction -Phase 'Prerequisite check'
+            if ($action -eq 'Exit') { return 'Exit' }
+            if ($action -eq 'Main' -or $action -eq 'Skip') { return 'Main' }
+            continue
+        }
 
         if (-not $settings.DryRun) {
             Show-SettingsSummary -Settings $settings
