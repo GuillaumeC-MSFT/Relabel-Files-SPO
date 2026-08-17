@@ -3890,10 +3890,10 @@ function Test-MeteredBillingPreflight {
                 $accountResourceType = @(@(Get-ObjectPropertyValue -InputObject $provider[0] -Names 'resourceTypes') | Where-Object {
                         [string](Get-ObjectPropertyValue -InputObject $_ -Names 'resourceType') -eq 'accounts'
                     } | Select-Object -First 1)
-                $providerApiVersions = if ($accountResourceType.Count -gt 0) {
-                    @((Get-ObjectPropertyValue -InputObject $accountResourceType[0] -Names 'apiVersions') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-                }
-                else { @() }
+                $providerApiVersions = @(if ($accountResourceType.Count -gt 0) {
+                        (Get-ObjectPropertyValue -InputObject $accountResourceType[0] -Names 'apiVersions') |
+                            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                    })
                 $apiVersionText = if ($providerApiVersions.Count -gt 0) { $providerApiVersions -join ', ' } else { '<not advertised>' }
                 Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
                     "Microsoft.GraphServices registration=$providerState; accounts API versions=$apiVersionText."
