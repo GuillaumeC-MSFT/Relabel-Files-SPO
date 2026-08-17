@@ -171,7 +171,7 @@ Uninstall-Module PnP.PowerShell -RequiredVersion <old-version> -Force
 
 Then open a **new** PowerShell window before running either script again.
 
-If the folder cannot be deleted because a file inside it is locked or access is denied, the utility offers to **rename** it instead. That works where deleting does not, because renaming a directory never opens the files inside it, and PowerShell only discovers a module in a folder whose name parses as a version number. A folder renamed to `1.12.0.disabled-<timestamp>` therefore stops shadowing the newer version immediately, with no reboot and no sign-out, and its files stay on disk for you to delete later. The version checks ignore such folders, so the warning does not come back.
+If the folder cannot be deleted because a file inside it is loaded or access is denied, the utility recommends **renaming** it instead. Renaming the parent does not delete its DLLs, so it often remains possible when deletion is denied, and PowerShell only discovers a module in a folder whose name parses as a version number. A folder renamed to `1.12.0.disabled-<timestamp>` is ignored by future PowerShell processes and can be deleted later. If the current process already loaded an assembly from that folder, it must be closed before the newer PnP version is used; no Windows sign-out or reboot is required. If renaming is also denied, check the folder permissions or security software rather than assuming an editor lock.
 
 Install and authentication guidance:
 

@@ -714,10 +714,44 @@ function Get-InstalledPnPVersion {
     }
 }
 
+function Get-LoadedAssemblyPath {
+    <# .SYNOPSIS Returns assemblies that the current PowerShell process loaded from a module folder. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Folder)
+
+    try {
+        $trimCharacters = [char[]]@([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+        $folderPrefix = [System.IO.Path]::GetFullPath($Folder).TrimEnd($trimCharacters) + [System.IO.Path]::DirectorySeparatorChar
+    }
+    catch { return @() }
+
+    $paths = [System.Collections.Generic.List[string]]::new()
+    foreach ($assembly in [AppDomain]::CurrentDomain.GetAssemblies()) {
+        try {
+            $location = [string]$assembly.Location
+            if ([string]::IsNullOrWhiteSpace($location)) { continue }
+            $fullPath = [System.IO.Path]::GetFullPath($location)
+            if ($fullPath.StartsWith($folderPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $paths.Add($fullPath) }
+        }
+        catch { Write-Verbose "Could not inspect one loaded assembly: $($_.Exception.Message)" }
+    }
+    return @($paths | Sort-Object -Unique)
+}
+
 function Show-PnPHoldingProcess {
     <# .SYNOPSIS Names the PowerShell processes holding a module folder open, because a loaded assembly cannot be deleted. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Folder)
+
+    $currentAssemblies = @(Get-LoadedAssemblyPath -Folder $Folder)
+    if ($currentAssemblies.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  This PowerShell process has already loaded files from that version:' -ForegroundColor Yellow
+        foreach ($path in @($currentAssemblies | Select-Object -First 5)) { Write-Host "    $path" -ForegroundColor DarkGray }
+        if ($currentAssemblies.Count -gt 5) { Write-Host "    ... and $($currentAssemblies.Count - 5) more" -ForegroundColor DarkGray }
+        Write-Host '  PowerShell cannot unload those assemblies. Rename the version folder now, then' -ForegroundColor Gray
+        Write-Host '  close this PowerShell process before using the newer PnP version.' -ForegroundColor Gray
+    }
 
     $candidates = [System.Collections.Generic.List[object]]::new()
     foreach ($process in @(Get-Process -Name 'pwsh', 'powershell', 'powershell_ise' -ErrorAction SilentlyContinue)) {
@@ -730,33 +764,36 @@ function Show-PnPHoldingProcess {
             $candidates.Add($process)
         }
     }
-    if ($candidates.Count -eq 0) {
+    if ($candidates.Count -eq 0 -and $currentAssemblies.Count -eq 0) {
         Write-Host ''
-        Write-Host '  No other PowerShell process is running, so the lock may be held by an editor' -ForegroundColor Gray
-        Write-Host '  extension host. Signing out and back in releases it for certain.' -ForegroundColor Gray
+        Write-Host '  No PowerShell process could be confirmed as holding that DLL. Access denied can' -ForegroundColor Gray
+        Write-Host '  also come from folder permissions, antivirus, or a process Windows will not let' -ForegroundColor Gray
+        Write-Host '  this session inspect. Try renaming the version folder first.' -ForegroundColor Gray
         return
     }
-    Write-Host ''
-    Write-Host '  These PowerShell processes may be holding that module open:' -ForegroundColor Yellow
-    foreach ($process in $candidates) {
-        $title = if ([string]::IsNullOrWhiteSpace($process.MainWindowTitle)) { '(no window - probably an editor terminal)' } else { $process.MainWindowTitle }
-        Write-Host ('    PID {0,-8} {1,-16} {2}' -f $process.Id, $process.ProcessName, $title)
+    if ($candidates.Count -gt 0) {
+        Write-Host ''
+        Write-Host '  These PowerShell processes may also be holding that module open:' -ForegroundColor Yellow
+        foreach ($process in $candidates) {
+            $title = if ([string]::IsNullOrWhiteSpace($process.MainWindowTitle)) { '(no window - possibly an editor terminal)' } else { $process.MainWindowTitle }
+            Write-Host ('    PID {0,-8} {1,-16} {2}' -f $process.Id, $process.ProcessName, $title)
+        }
+        Write-Host '  Close a confirmed holder before deleting the folder, or rename the folder now.' -ForegroundColor Gray
     }
-    Write-Host '  Close them and run this again, or sign out and back in.' -ForegroundColor Gray
 }
 
 function Disable-ModuleVersionFolder {
-    <# .SYNOPSIS Renames a module version folder so PowerShell stops discovering it, which succeeds even while its files are locked. #>
+    <# .SYNOPSIS Renames a module version folder so PowerShell stops discovering it without deleting its files. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Folder)
 
     $newName = '{0}.disabled-{1}' -f (Split-Path -Leaf $Folder), (Get-Date -Format 'yyyyMMdd-HHmmss')
     if (-not $PSCmdlet.ShouldProcess($Folder, "Rename to $newName")) { return $false }
     try {
-        # Renaming a directory does not open the files inside it, so a loaded assembly cannot block this.
+        # Renaming the parent does not delete its DLLs, so it often remains possible after deletion is denied.
         Rename-Item -LiteralPath $Folder -NewName $newName -ErrorAction Stop
         $renamed = Join-Path (Split-Path -Parent $Folder) $newName
-        Write-RunLog -Severity SUCCESS -Action 'Check prerequisite' -Result "Renamed that version to '$newName'. Module discovery only accepts a folder named after a valid version, so PowerShell no longer sees it."
+        Write-RunLog -Severity SUCCESS -Action 'Check prerequisite' -Result "Renamed that version to '$newName'. Module discovery only accepts a folder named after a valid version, so new PowerShell processes no longer see it."
         Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "Delete it once nothing holds it open: Remove-Item '$renamed' -Recurse -Force"
         return $true
     }
@@ -781,8 +818,7 @@ function Test-PnPVersionHygiene {
 
     $loaded = Get-Module -Name PnP.PowerShell | Sort-Object Version -Descending | Select-Object -First 1
     if ($loaded) {
-        Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "PnP.PowerShell $($loaded.Version) is already loaded here, so the older copies cannot be removed from this session. Do it from a PowerShell window that has not used PnP yet."
-        return
+        Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "PnP.PowerShell $($loaded.Version) is already loaded here. A loaded DLL cannot be deleted from this process, so cleanup will prefer renaming its version folder; this process must then close before another PnP version is loaded."
     }
 
     $choice = Read-MenuChoice -Title 'Remove the older PnP.PowerShell copies now?' -Options ([ordered]@{
@@ -800,21 +836,30 @@ function Test-PnPVersionHygiene {
             $folders = @(Get-Module -ListAvailable -Name PnP.PowerShell -All -ErrorAction SilentlyContinue |
                     Where-Object { [string]$_.Version -eq [string]$version } |
                     Select-Object -ExpandProperty ModuleBase -Unique)
-            Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "Uninstall-Module could not remove PnP.PowerShell ${version}: $(Get-ErrorText -ErrorRecord $_). That usually means it was installed for the other PowerShell edition, so it is not in this host's module paths."
+            Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "Uninstall-Module could not remove PnP.PowerShell ${version}: $(Get-ErrorText -ErrorRecord $_). It may belong to another PowerShell edition, have a loaded DLL, or be protected by folder permissions."
             foreach ($folder in $folders) {
                 # Refuse to touch anything that is not a PnP.PowerShell version folder.
                 if ($folder -notmatch '(?i)[\\/]PnP\.PowerShell[\\/]' -or -not (Test-Path -LiteralPath $folder -PathType Container)) { continue }
+                $loadedAssemblyPaths = @(Get-LoadedAssemblyPath -Folder $folder)
+                if ($loadedAssemblyPaths.Count -gt 0) {
+                    Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "This PowerShell process has loaded $($loadedAssemblyPaths.Count) assembly file(s) from '$folder', so deleting that folder cannot succeed until this process exits. Renaming is still worth trying."
+                }
                 $deleteChoice = Read-MenuChoice -Title 'Remove that version another way?' -Options ([ordered]@{
-                        '1' = "Yes, delete $folder"
-                        '2' = 'Rename it instead, which works even while its files are locked'
+                        '1' = "Rename $folder so PowerShell stops discovering it (recommended)"
+                        '2' = 'Try to delete it now'
                         '3' = 'No, leave it in place'
                     }) -Default '1'
                 if ($deleteChoice -eq '3') {
                     Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "Remove it later with: Remove-Item '$folder' -Recurse -Force"
                     continue
                 }
-                if ($deleteChoice -eq '2') {
-                    $null = Disable-ModuleVersionFolder -Folder $folder -Confirm:$false
+                if ($deleteChoice -eq '1') {
+                    if (Disable-ModuleVersionFolder -Folder $folder -Confirm:$false) {
+                        if ($loadedAssemblyPaths.Count -gt 0) {
+                            throw 'The old PnP.PowerShell folder is disabled, but this PowerShell process already loaded assemblies from it. Close this PowerShell process and run the utility again; no Windows sign-out or reboot is required.'
+                        }
+                    }
+                    else { Show-PnPHoldingProcess -Folder $folder }
                     continue
                 }
                 try {
@@ -825,10 +870,15 @@ function Test-PnPVersionHygiene {
                     Add-RunFailure -FilePath $folder -Action 'Check prerequisite' -Reason (Get-ErrorText -ErrorRecord $_)
                     Show-PnPHoldingProcess -Folder $folder
                     $renameChoice = Read-MenuChoice -Title 'Rename that folder instead, so this version stops shadowing the newest one?' -Options ([ordered]@{
-                            '1' = 'Yes, rename it now (no restart needed)'
+                            '1' = 'Yes, rename it now'
                             '2' = 'No, I will remove it myself later'
                         }) -Default '1'
-                    if ($renameChoice -eq '1' -and (Disable-ModuleVersionFolder -Folder $folder -Confirm:$false)) { continue }
+                    if ($renameChoice -eq '1' -and (Disable-ModuleVersionFolder -Folder $folder -Confirm:$false)) {
+                        if ($loadedAssemblyPaths.Count -gt 0) {
+                            throw 'The old PnP.PowerShell folder is disabled, but this PowerShell process already loaded assemblies from it. Close this PowerShell process and run the utility again; no Windows sign-out or reboot is required.'
+                        }
+                        continue
+                    }
                     Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "Then run: Remove-Item '$folder' -Recurse -Force"
                 }
             }
