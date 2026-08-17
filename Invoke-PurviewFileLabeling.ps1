@@ -3963,13 +3963,26 @@ function Test-MeteredBillingPreflight {
             Write-RunLog -Severity WARN -Action 'Check application owner' -Result "Azure CLI could not identify a signed-in user, so application ownership could not be verified independently. The documented create command will remain the authoritative check. $(("$operatorOutput" -replace '\s+', ' ').Trim())"
         }
 
-        $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId --query location --output tsv --only-show-errors 2>&1
+        $groupOutput = & az group show --name $ResourceGroup --subscription $SubscriptionId `
+            --query '{location:location,provisioningState:properties.provisioningState}' --output json --only-show-errors 2>&1
         if ($LASTEXITCODE -ne 0) {
             $problems.Add("Resource group '$ResourceGroup' cannot be read in subscription ${SubscriptionId}: $(("$groupOutput" -replace '\s+', ' ').Trim())")
         }
         else {
-            Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
-                "Resource group=$ResourceGroup; location=$("$groupOutput".Trim()); read check=succeeded."
+            $group = @((ConvertFrom-AzureCliJson -Output $groupOutput) | Select-Object -First 1)
+            if ($group.Count -eq 0) {
+                $problems.Add("Azure returned no readable details for resource group '$ResourceGroup'.")
+            }
+            else {
+                $groupLocation = [string](Get-ObjectPropertyValue -InputObject $group[0] -Names 'location')
+                $groupState = [string](Get-ObjectPropertyValue -InputObject $group[0] -Names 'provisioningState')
+                Write-RunLog -Severity INFO -Action 'Record Azure billing diagnostics' -NoConsole -Result `
+                    "Resource group=$ResourceGroup; location=$groupLocation; provisioning state=$groupState."
+                if ($groupState -ne 'Succeeded') {
+                    $reportedState = if ([string]::IsNullOrWhiteSpace($groupState)) { '<not reported>' } else { $groupState }
+                    $problems.Add("Resource group '$ResourceGroup' is in provisioning state '$reportedState', not Succeeded.")
+                }
+            }
         }
 
         $providerOutput = & az provider show --namespace Microsoft.GraphServices --subscription $SubscriptionId `
@@ -4149,7 +4162,9 @@ try {
             $null = Set-AzContext -Subscription $arguments['SubscriptionId'] -ErrorAction Stop
             Import-AzResourcesModule
             $groups = @(Get-AzResourceGroup -ErrorAction Stop)
-            $result.Value = @($groups | ForEach-Object { @{ Name = [string]$_.ResourceGroupName; Location = [string]$_.Location } })
+            $result.Value = @($groups | ForEach-Object {
+                    @{ Name = [string]$_.ResourceGroupName; Location = [string]$_.Location; State = [string]$_.ProvisioningState }
+                })
             $result.Status = 'Listed'
         }
         'CreateResourceGroup' {
@@ -4196,10 +4211,18 @@ try {
                 $result.Message = "Subscription $subscriptionId belongs to tenant $($subscription[0].TenantId), not application tenant $TenantId."
                 break
             }
-            try { $null = Get-AzResourceGroup -Name $resourceGroup -ErrorAction Stop }
+            $group = @()
+            try { $group = @(Get-AzResourceGroup -Name $resourceGroup -ErrorAction Stop | Select-Object -First 1) }
             catch {
                 $result.Status = 'PreflightFailed'
                 $result.Message = "Resource group '$resourceGroup' cannot be read in subscription ${subscriptionId}: $($_.Exception.Message)"
+                break
+            }
+            $groupState = if ($group.Count -eq 0) { '' } else { [string]$group[0].ProvisioningState }
+            if ($groupState -ne 'Succeeded') {
+                $reportedState = if ([string]::IsNullOrWhiteSpace($groupState)) { '<not reported>' } else { $groupState }
+                $result.Status = 'PreflightFailed'
+                $result.Message = "Resource group '$resourceGroup' is in provisioning state '$reportedState', not Succeeded."
                 break
             }
 
@@ -5135,11 +5158,17 @@ function Get-AzureResourceGroupDetail {
             $raw = & az group list --subscription $SubscriptionId --output json 2>$null
             if ($LASTEXITCODE -ne 0) { return @() }
             return @(ConvertFrom-AzureCliJson -Output $raw | ForEach-Object {
+                    $propertiesProperty = $_.PSObject.Properties['properties']
+                    $properties = if ($null -eq $propertiesProperty) { $null } else { $propertiesProperty.Value }
                     [pscustomobject]@{
                         Name = Get-ObjectPropertyValue -InputObject $_ -Names 'name'
                         Location = Get-ObjectPropertyValue -InputObject $_ -Names 'location'
+                        State = if ($null -eq $properties) { '' } else { Get-ObjectPropertyValue -InputObject $properties -Names 'provisioningState' }
                     }
-                } | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) })
+                } | Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_.Name) -and
+                    [string]::Equals([string]$_.State, 'Succeeded', [System.StringComparison]::OrdinalIgnoreCase)
+                })
         }
         catch {
             Write-Verbose "Could not list resource groups: $($_.Exception.Message)"
@@ -5149,8 +5178,11 @@ function Get-AzureResourceGroupDetail {
     $response = Invoke-AzureModuleAction -Action 'ListResourceGroups' -Arguments @{SubscriptionId = $SubscriptionId}
     if ($response.Status -ne 'Listed') { return @() }
     return @(@($response.Value) | ForEach-Object {
-            [pscustomobject]@{Name = [string]$_.Name; Location = [string]$_.Location}
-        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) })
+            [pscustomobject]@{Name = [string]$_.Name; Location = [string]$_.Location; State = [string]$_.State}
+        } | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.Name) -and
+            [string]::Equals([string]$_.State, 'Succeeded', [System.StringComparison]::OrdinalIgnoreCase)
+        })
 }
 
 function Get-AzureResourceGroupList {
