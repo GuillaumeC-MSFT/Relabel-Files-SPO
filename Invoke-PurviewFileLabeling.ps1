@@ -5999,7 +5999,7 @@ function Wait-ForBillingLink {
             Write-Host '  Choose option 3 again to use the same saved values and accept the provider-' -ForegroundColor Gray
             Write-Host '  advertised preview recovery if it is offered.' -ForegroundColor Gray
         }
-        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The pending link was retained without an automatic retry because Microsoft.GraphServices returned its known OpenTelemetry type-load failure.'
+        Write-RunLog -Severity WARN -Action 'Link metered billing' -Result 'The pending link was retained without an automatic retry because Microsoft.GraphServices returned an OpenTelemetry type-load failure.'
         return $false
     }
     if ($script:LastBillingWasClientFault) {
