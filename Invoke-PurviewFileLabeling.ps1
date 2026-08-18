@@ -78,6 +78,7 @@ $script:LastBillingPreviewAttempted = $false
 $script:LastBillingFailureSignature = ''
 $script:LastBillingPreflightFailed = $false
 $script:LastBillingResourceStatus = $null
+$script:LastSharePointTenantLookupStatus = ''
 # Every certificate this run generates is tracked, so nothing it created outlives its use.
 $script:CreatedCertificateThumbprints = [System.Collections.Generic.List[string]]::new()
 # Windows PowerShell writes a BOM for 'utf8' and PowerShell 7 does not, yet Excel needs one to read non-ASCII paths correctly.
@@ -1872,37 +1873,78 @@ function Get-SharePointDocumentLibrary {
 }
 
 function Get-SharePointTenantId {
-    <# .SYNOPSIS Reads the tenant GUID from SharePoint's anonymous authentication challenge. #>
+    <# .SYNOPSIS Reads the tenant GUID from SharePoint, distinguishing a missing site from an omitted realm. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$SiteUrl)
 
-    $response = $null
+    $script:LastSharePointTenantLookupStatus = 'InvalidUrl'
     try {
-        $response = Invoke-WebRequest -Uri "$($SiteUrl.TrimEnd('/'))/_vti_bin/client.svc/" -Method Get -Headers @{ Authorization = 'Bearer' } -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -ErrorAction Stop
+        $siteUri = [uri]$SiteUrl
+        if (-not $siteUri.IsAbsoluteUri -or $siteUri.Scheme -ne 'https') { return '' }
+        $tenantRoot = $siteUri.GetLeftPart([System.UriPartial]::Authority)
     }
-    catch {
-        $responseProperty = $_.Exception.PSObject.Properties['Response']
-        if ($responseProperty) { $response = $responseProperty.Value }
-    }
-    if ($null -eq $response -or $null -eq $response.Headers) { return '' }
+    catch { return '' }
 
-    $header = ''
-    try {
-        # PowerShell 7 returns HttpResponseHeaders, which has no string indexer; Windows PowerShell returns WebHeaderCollection, which has no TryGetValues.
-        if ($response.Headers.PSObject.Methods['TryGetValues']) {
-            $values = $null
-            if ($response.Headers.TryGetValues('WWW-Authenticate', [ref]$values)) { $header = ($values -join ',') }
+    $probeRealm = {
+        param([Parameter(Mandatory)][string]$Uri)
+
+        $response = $null
+        try {
+            $response = Invoke-WebRequest -Uri $Uri -Method Get -Headers @{ Authorization = 'Bearer' } -UseBasicParsing -MaximumRedirection 0 -TimeoutSec 20 -ErrorAction Stop
         }
-        else {
-            $header = [string]$response.Headers['WWW-Authenticate']
+        catch {
+            $responseProperty = $_.Exception.PSObject.Properties['Response']
+            if ($responseProperty) { $response = $responseProperty.Value }
         }
+        if ($null -eq $response) { return [pscustomobject]@{StatusCode = 0; TenantId = ''} }
+
+        $statusCode = 0
+        try { $statusCode = [int]$response.StatusCode }
+        catch { Write-Verbose "Could not read the SharePoint response status: $($_.Exception.Message)" }
+
+        $header = ''
+        try {
+            # PowerShell 7 returns HttpResponseHeaders, which has no string indexer; Windows PowerShell returns WebHeaderCollection, which has no TryGetValues.
+            if ($response.Headers.PSObject.Methods['TryGetValues']) {
+                $values = $null
+                if ($response.Headers.TryGetValues('WWW-Authenticate', [ref]$values)) { $header = ($values -join ',') }
+            }
+            else {
+                $header = [string]$response.Headers['WWW-Authenticate']
+            }
+        }
+        catch { Write-Verbose "Could not read the SharePoint authentication header: $($_.Exception.Message)" }
+        $realmMatch = [regex]::Match($header, '(?i)\brealm\s*=\s*"?(?<value>[^",\s]+)')
+        $tenantId = [guid]::Empty
+        if ($realmMatch.Success -and [guid]::TryParse($realmMatch.Groups['value'].Value, [ref]$tenantId) -and $tenantId -ne [guid]::Empty) {
+            return [pscustomobject]@{StatusCode = $statusCode; TenantId = $tenantId.ToString()}
+        }
+        return [pscustomobject]@{StatusCode = $statusCode; TenantId = ''}
     }
-    catch { Write-Verbose "Could not read the SharePoint authentication header: $($_.Exception.Message)" }
-    $realmMatch = [regex]::Match($header, '(?i)\brealm\s*=\s*"?(?<value>[^",\s]+)')
-    if (-not $realmMatch.Success) { return '' }
-    $tenantId = [guid]::Empty
-    if (-not [guid]::TryParse($realmMatch.Groups['value'].Value, [ref]$tenantId) -or $tenantId -eq [guid]::Empty) { return '' }
-    return $tenantId.ToString()
+
+    $siteEndpoint = "$($SiteUrl.TrimEnd('/'))/_vti_bin/client.svc/"
+    $siteProbe = & $probeRealm -Uri $siteEndpoint
+    if (-not [string]::IsNullOrWhiteSpace($siteProbe.TenantId)) {
+        $script:LastSharePointTenantLookupStatus = 'Ready'
+        return $siteProbe.TenantId
+    }
+    if ($siteProbe.StatusCode -eq 404) {
+        $script:LastSharePointTenantLookupStatus = 'SiteNotFound'
+        return ''
+    }
+
+    $rootEndpoint = "$tenantRoot/_vti_bin/client.svc/"
+    if ([string]::Equals($siteEndpoint, $rootEndpoint, [System.StringComparison]::OrdinalIgnoreCase)) {
+        $script:LastSharePointTenantLookupStatus = 'RealmMissing'
+        return ''
+    }
+    $rootProbe = & $probeRealm -Uri $rootEndpoint
+    if (-not [string]::IsNullOrWhiteSpace($rootProbe.TenantId)) {
+        $script:LastSharePointTenantLookupStatus = 'ReadyFromTenantRoot'
+        return $rootProbe.TenantId
+    }
+    $script:LastSharePointTenantLookupStatus = 'RealmMissing'
+    return ''
 }
 
 function Save-LabelingClientId {
@@ -2289,6 +2331,9 @@ function New-LabelingApplication {
     try {
         $tenantId = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId } else { Get-SharePointTenantId -SiteUrl $SiteUrl }
         if ([string]::IsNullOrWhiteSpace($tenantId)) {
+            if ($script:LastSharePointTenantLookupStatus -eq 'SiteNotFound') {
+                throw "SharePoint returned 404 for '$SiteUrl'. The site may have been deleted or the URL may be incorrect."
+            }
             throw "SharePoint at '$SiteUrl' did not return a tenant realm, so the application cannot be registered against a verified tenant."
         }
 
@@ -2543,7 +2588,11 @@ function Read-SharePointTarget {
         # The tenant comes from SharePoint itself, so nothing remembered from a previous tenant can be reused here.
         $tenantId = Get-SharePointTenantId -SiteUrl $siteUrl
         if ([string]::IsNullOrWhiteSpace($tenantId)) {
-            Add-RunFailure -FilePath $siteUrl -Action 'Resolve tenant' -Reason 'SharePoint did not return a tenant realm for this site, so the sign-in tenant could not be verified.'
+            $reason = if ($script:LastSharePointTenantLookupStatus -eq 'SiteNotFound') {
+                'SharePoint returned 404 for this site. It may have been deleted or the URL may be incorrect.'
+            }
+            else { 'SharePoint did not return a tenant realm for this site, so the sign-in tenant could not be verified.' }
+            Add-RunFailure -FilePath $siteUrl -Action 'Resolve tenant' -Reason $reason
             if ((Read-MenuChoice -Title 'Try a different site URL?' -Options ([ordered]@{'1' = 'Yes'; '2' = 'No, return to the main menu'}) -Default '1') -eq '1') { continue }
             return $null
         }
@@ -5425,7 +5474,11 @@ function Invoke-MeteredSetup {
     Save-RememberedValue -Name 'PURVIEW_FILE_LABELING_SITE_URL' -Value $siteUrl
     $tenantId = Get-SharePointTenantId -SiteUrl $siteUrl
     if ([string]::IsNullOrWhiteSpace($tenantId)) {
-        Add-RunFailure -FilePath $siteUrl -Action 'Resolve tenant' -Reason 'SharePoint did not return a tenant realm, so no application was registered.'
+        $reason = if ($script:LastSharePointTenantLookupStatus -eq 'SiteNotFound') {
+            'SharePoint returned 404 for this site. It may have been deleted or the URL may be incorrect, so no application was registered.'
+        }
+        else { 'SharePoint did not return a tenant realm, so no application was registered.' }
+        Add-RunFailure -FilePath $siteUrl -Action 'Resolve tenant' -Reason $reason
         return 'Main'
     }
     Write-RunLog -Severity SUCCESS -Action 'Resolve tenant' -Result "SharePoint reports tenant $tenantId."
