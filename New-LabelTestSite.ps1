@@ -35,6 +35,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:LibraryTitle = 'Label Test Library'
 $script:LibraryUrl = 'LabelTestLibrary'
+# Shared by log names and the generated site and application names.
+$script:TimestampFormat = 'yyyyMMdd-HHmmss'
 $script:LogPath = ''
 $script:LogBuffer = [System.Collections.Generic.List[string]]::new()
 # Only an application this run registered may ever be cleaned up.
@@ -127,7 +129,7 @@ function Start-RunLog {
         if (-not (Test-Path -LiteralPath $Folder -PathType Container)) {
             $null = New-Item -ItemType Directory -Path $Folder -Force -ErrorAction Stop
         }
-        $candidatePath = Join-Path $Folder ("New-LabelTestSite-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $candidatePath = Join-Path $Folder ("New-LabelTestSite-{0}.log" -f (Get-Date -Format $script:TimestampFormat))
         Set-Content -LiteralPath $candidatePath -Value $script:LogBuffer -Encoding utf8 -ErrorAction Stop
         $script:LogPath = $candidatePath
         Write-Step -Severity Good -Message "Logging every action to $candidatePath"
@@ -1063,7 +1065,7 @@ function Register-PnPInteractiveApplication {
         catch {
             if ($attempt -eq 3 -or [string]$_.Exception.Message -notmatch '(?i)already exists') { throw }
             # This application is disposable and removed on exit, so a name collision just takes the next free name.
-            $parameters.ApplicationName = "$ApplicationName $(Get-Date -Format 'yyyyMMdd-HHmmss')"
+            $parameters.ApplicationName = "$ApplicationName $(Get-Date -Format $script:TimestampFormat)"
             Write-Step -Severity Warn -Message "An application named '$ApplicationName' already exists, so this run registers '$($parameters.ApplicationName)' instead."
         }
     }
@@ -1991,7 +1993,7 @@ try {
         $SiteName.Trim()
     }
     else {
-        "Label Test $(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        "Label Test $(Get-Date -Format $script:TimestampFormat)"
     }
     $defaultLibraryName = if (-not [string]::IsNullOrWhiteSpace($LibraryName)) { $LibraryName.Trim() } else { $script:LibraryTitle }
 

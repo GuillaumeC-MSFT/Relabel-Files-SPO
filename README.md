@@ -166,11 +166,11 @@ Because a loaded assembly cannot be replaced in a running session, the utility *
 
 ### More than one PnP.PowerShell version installed
 
-PnP.PowerShell loads .NET assemblies, and .NET cannot unload them. Whichever version a PowerShell session touches **first** therefore wins for the life of that session, and `Import-Module -RequiredVersion` will not replace it. If an older copy is still installed, it can silently disable newer features — registering a confidential client, for example — while every version check appears to pass.
+PnP.PowerShell loads .NET assemblies, and .NET cannot unload them. Whichever version a PowerShell session touches **first** therefore wins for the life of that session, and `Import-Module -RequiredVersion` will not replace it. If an older copy is still installed, it can silently disable newer features such as registering a confidential client, while every version check appears to pass.
 
 This is easy to miss, because `Get-Module -ListAvailable` reports only the **newest** version per module; older copies are invisible unless you add `-All`. Both scripts now enumerate with `-All`, warn when more than one version is installed, and `Invoke-PurviewFileLabeling.ps1` offers to uninstall the older ones. That offer only appears in a session that has not yet loaded PnP, since a loaded module cannot be removed.
 
-`Uninstall-Module` only sees modules in the current host's module paths, so a copy installed for the other PowerShell edition — typically under `Documents\WindowsPowerShell\Modules` while you are running PowerShell 7 — cannot be uninstalled that way. When that happens the utility recommends renaming the version folder so PowerShell stops discovering it; immediate deletion is the secondary choice. It refuses any path that is not a `PnP.PowerShell` version folder. To clean up by hand:
+`Uninstall-Module` only sees modules in the current host's module paths, so a copy installed for the other PowerShell edition, typically under `Documents\WindowsPowerShell\Modules` while you are running PowerShell 7, cannot be uninstalled that way. When that happens the utility recommends renaming the version folder so PowerShell stops discovering it; immediate deletion is the secondary choice. If the folder itself cannot be renamed, which is what happens once a session has loaded its assemblies, the utility renames the module manifest instead. PowerShell finds a module through its manifest, so that retires the version even while its files stay locked. It refuses any path that is not a `PnP.PowerShell` version folder, and it reports afterwards whether more than one version is still discoverable. To clean up by hand:
 
 ```powershell
 Get-Module -ListAvailable -Name PnP.PowerShell -All | Select-Object Version, ModuleBase
@@ -340,7 +340,7 @@ The embedded browser sometimes offers only a passkey, and on a device enrolled w
 
 You are not asked to sign in repeatedly either. Before authenticating, the utility checks whether the connection it already holds serves the same site with the same application, and proves it with a live call rather than trusting a stale object. If it does, that sign-in is reused and no browser window opens at all, which matters when a window can appear behind the console and be missed. Forcing a fresh sign-in always bypasses the reuse.
 
-`New-LabelTestSite.ps1` behaves the same way: a failed sign-in no longer ends the run. It explains the failure — naming the tenant when the application belongs to a different one — and offers to retry with device code, forget the remembered application and register a fresh one for this tenant, enter a different client ID, or stop. `-AuthMode DeviceCode` selects device code from the start.
+`New-LabelTestSite.ps1` behaves the same way: a failed sign-in no longer ends the run. It explains the failure, naming the tenant when the application belongs to a different one, and offers to retry with device code, forget the remembered application and register a fresh one for this tenant, enter a different client ID, or stop. `-AuthMode DeviceCode` selects device code from the start.
 
 ### Run artifacts may contain tenant information
 

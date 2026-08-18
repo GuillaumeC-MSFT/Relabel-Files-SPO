@@ -23,6 +23,8 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:UtilityVersion = '1.1.0'
+# Shared by log and report names, retired module folders, and generated display names.
+$script:TimestampFormat = 'yyyyMMdd-HHmmss'
 # Floors, not pins: the utility probes for the commands and parameters it needs, and warns when a
 # version is old enough that those probes are likely to start failing.
 $script:ModuleExpectation = @(
@@ -343,7 +345,7 @@ function Initialize-RunArtifact {
                 $null = New-Item -ItemType Directory -Path $Folder -Force -ErrorAction Stop
             }
         }
-        $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+        $stamp = Get-Date -Format $script:TimestampFormat
         $script:LogPath = Join-Path $Folder "Invoke-PurviewFileLabeling-$stamp.log"
         $script:ReportPath = Join-Path $Folder "Invoke-PurviewFileLabeling-$stamp.csv"
         if ($PSCmdlet.ShouldProcess($script:LogPath, 'Create log file')) {
@@ -808,12 +810,36 @@ function Show-PnPHoldingProcess {
     }
 }
 
+function Disable-ModuleManifest {
+    <# .SYNOPSIS Renames the manifests in a module version folder, which is what module discovery reads. #>
+    [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
+    param(
+        [Parameter(Mandatory)][string]$Folder,
+        [Parameter(Mandatory)][string]$Suffix
+    )
+
+    $renamed = [System.Collections.Generic.List[string]]::new()
+    $candidates = @(Get-ChildItem -LiteralPath $Folder -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -in '.psd1', '.psm1' })
+    foreach ($manifest in $candidates) {
+        $target = '{0}.{1}' -f $manifest.Name, $Suffix
+        if (-not $PSCmdlet.ShouldProcess($manifest.FullName, "Rename to $target")) { continue }
+        try {
+            Rename-Item -LiteralPath $manifest.FullName -NewName $target -ErrorAction Stop
+            $renamed.Add($manifest.FullName)
+        }
+        catch { Write-Verbose "Could not rename $($manifest.FullName): $($_.Exception.Message)" }
+    }
+    return @($renamed)
+}
+
 function Disable-ModuleVersionFolder {
-    <# .SYNOPSIS Renames a module version folder so PowerShell stops discovering it without deleting its files. #>
+    <# .SYNOPSIS Stops PowerShell discovering a module version, without deleting any of its files. #>
     [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
     param([Parameter(Mandatory)][string]$Folder)
 
-    $newName = '{0}.disabled-{1}' -f (Split-Path -Leaf $Folder), (Get-Date -Format 'yyyyMMdd-HHmmss')
+    $suffix = 'disabled-{0}' -f (Get-Date -Format $script:TimestampFormat)
+    $newName = '{0}.{1}' -f (Split-Path -Leaf $Folder), $suffix
     if (-not $PSCmdlet.ShouldProcess($Folder, "Rename to $newName")) { return $false }
     try {
         # Renaming the parent does not delete its DLLs, so it often remains possible after deletion is denied.
@@ -824,7 +850,16 @@ function Disable-ModuleVersionFolder {
         return $true
     }
     catch {
-        Add-RunFailure -FilePath $Folder -Action 'Check prerequisite' -Reason (Get-ErrorText -ErrorRecord $_)
+        $folderReason = Get-ErrorText -ErrorRecord $_
+        # Windows maps a loaded assembly into memory, which blocks renaming the folder holding it.
+        # A manifest is only ever read, and discovery needs one, so renaming it retires the version.
+        $manifests = @(Disable-ModuleManifest -Folder $Folder -Suffix $suffix -Confirm:$false)
+        if ($manifests.Count -gt 0) {
+            Write-RunLog -Severity SUCCESS -Action 'Check prerequisite' -Result "That folder is in use and could not be renamed, so its $($manifests.Count) manifest file(s) were renamed instead. PowerShell finds a module through its manifest, so new processes no longer see this version."
+            Write-RunLog -Severity INFO -Action 'Check prerequisite' -Result "Delete the folder once nothing holds it open: Remove-Item '$Folder' -Recurse -Force"
+            return $true
+        }
+        Add-RunFailure -FilePath $Folder -Action 'Check prerequisite' -Reason $folderReason
         return $false
     }
 }
@@ -910,6 +945,13 @@ function Test-PnPVersionHygiene {
             }
         }
     }
+
+    $remaining = @(Get-InstalledPnPVersion)
+    if ($remaining.Count -le 1) {
+        Write-RunLog -Severity SUCCESS -Action 'Check prerequisite' -Result "PnP.PowerShell $newest is now the only version PowerShell can discover."
+        return
+    }
+    Write-RunLog -Severity WARN -Action 'Check prerequisite' -Result "PowerShell can still discover PnP.PowerShell $($remaining -join ', '), so whichever one a session loads first still wins."
 }
 
 function Test-SharePointPrerequisite {
@@ -2050,7 +2092,7 @@ function Read-DuplicateApplicationChoice {
         Write-RunLog -Severity WARN -Action 'Validate application ID' -Result "'$typed' is not a valid GUID."
         return $null
     }
-    return [pscustomobject]@{Action = 'Rename'; Value = "$DisplayName $(Get-Date -Format 'yyyyMMdd-HHmmss')"}
+    return [pscustomobject]@{Action = 'Rename'; Value = "$DisplayName $(Get-Date -Format $script:TimestampFormat)"}
 }
 
 function Invoke-GraphAction {
