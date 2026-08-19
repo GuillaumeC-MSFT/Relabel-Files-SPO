@@ -1626,10 +1626,20 @@ function Get-DependencyReport {
     [CmdletBinding()]
     param()
 
+    # One scan: -ListAvailable walks every module path on each call, which costs about a second.
+    $names = @($script:ModuleExpectation | ForEach-Object { $_.Name } | Sort-Object -Unique)
+    $newestByName = @{}
+    foreach ($module in @(Get-Module -ListAvailable -Name $names -ErrorAction SilentlyContinue)) {
+        if ($null -eq $module.Version) { continue }
+        $name = [string]$module.Name
+        $version = [version]$module.Version
+        if (-not $newestByName.ContainsKey($name) -or $version -gt $newestByName[$name]) {
+            $newestByName[$name] = $version
+        }
+    }
+
     return @(foreach ($expectation in $script:ModuleExpectation) {
-            $newest = @(Get-Module -ListAvailable -Name $expectation.Name -ErrorAction SilentlyContinue |
-                    Sort-Object Version -Descending | Select-Object -First 1)
-            $version = if ($newest.Count -gt 0) { [version]$newest[0].Version } else { $null }
+            $version = if ($newestByName.ContainsKey($expectation.Name)) { $newestByName[$expectation.Name] } else { $null }
             [pscustomobject]@{
                 Name = $expectation.Name
                 Installed = $version
