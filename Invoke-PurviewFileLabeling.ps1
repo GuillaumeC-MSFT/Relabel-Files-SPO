@@ -1543,7 +1543,6 @@ function Invoke-FileProcessing {
                     Add-FileResult -FilePath $file.FullName -NewLabel $TargetLabel.Name -Outcome 'Failed' -Details $reason
                     Write-RunLog -Severity ERROR -Action 'Apply label' -Result 'Microsoft Graph rejected the assignment with paymentRequired, so the run stopped instead of failing on every remaining file.'
                     Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'assignSensitivityLabel is billed per call and accepted only from a confidential client. Choose "Enable SharePoint Online metered label writing" on the main menu to register one and link an Azure subscription. See https://aka.ms/graph-metered-overview'
-                    Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'Microsoft also classes this as a protected API, so access must be requested from them in addition to billing and consent. See https://learn.microsoft.com/graph/metered-api-list'
                     Write-RunLog -Severity INFO -Action 'Metered API guidance' -Result 'A token issued before the billing link was created is still refused, so start the utility again after linking. At no extra cost: use a Purview auto-labeling policy, or sync the library with OneDrive and run the local source against the synced folder.'
                     return 'Main'
                 }
@@ -2811,8 +2810,8 @@ function Read-RunMode {
         Write-Host '  metered and protected API that accepts confidential clients only.' -ForegroundColor Yellow
         Write-Host ''
         Write-Host '  To enable it, register a certificate-based application with application' -ForegroundColor Gray
-        Write-Host '  Files.ReadWrite.All, grant administrator consent and protected-API access,' -ForegroundColor Gray
-        Write-Host '  then associate the application with an Azure subscription by creating a' -ForegroundColor Gray
+        Write-Host '  Files.ReadWrite.All, grant it administrator consent, then associate the' -ForegroundColor Gray
+        Write-Host '  application with an Azure subscription by creating a' -ForegroundColor Gray
         Write-Host '  Microsoft.GraphServices/accounts resource. This utility guides that setup.' -ForegroundColor Gray
         Write-Host ''
         Write-Host '  Local paths, UNC shares, and file access to SharePoint Server use the separate' -ForegroundColor Cyan
@@ -2889,8 +2888,8 @@ function Read-LocalFolder {
 
     Write-Host ''
     Write-Host '  OneDrive already syncs the libraries below. Labeling a synced copy uses the' -ForegroundColor Gray
-    Write-Host '  Purview client, so it needs no metered API, no Azure billing, and no extra' -ForegroundColor Gray
-    Write-Host '  approval; the client uploads each change back to SharePoint.' -ForegroundColor Gray
+    Write-Host '  Purview client, so it needs no metered API and no Azure billing; the client' -ForegroundColor Gray
+    Write-Host '  uploads each change back to SharePoint.' -ForegroundColor Gray
     $options = [ordered]@{}
     for ($index = 0; $index -lt $synced.Count; $index++) {
         $options[[string]($index + 1)] = '{0}  ({1})' -f $synced[$index].Path, $synced[$index].Tenant
@@ -5455,11 +5454,11 @@ function Invoke-MeteredSetup {
     Write-Host '  and Contributor rights on it. Metered APIs are unavailable in national clouds,' -ForegroundColor Yellow
     Write-Host '  including GCC.' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  One more thing this utility cannot do for you: Microsoft classes' -ForegroundColor Yellow
-    Write-Host '  assignSensitivityLabel as a protected API, which needs approval beyond' -ForegroundColor Yellow
-    Write-Host '  permissions, consent and billing. Access has to be requested from Microsoft;' -ForegroundColor Yellow
-    Write-Host '  see https://learn.microsoft.com/graph/metered-api-list for how. Until that is' -ForegroundColor Yellow
-    Write-Host '  granted, calls can still be refused even with everything below completed.' -ForegroundColor Yellow
+    Write-Host '  Microsoft classes assignSensitivityLabel as a protected API, which means it' -ForegroundColor Yellow
+    Write-Host '  needs validation beyond permissions and consent. For this API that validation' -ForegroundColor Yellow
+    Write-Host '  is the Azure billing link in step 3; Microsoft documents no separate request' -ForegroundColor Yellow
+    Write-Host '  form for it. A token issued before that link exists is still refused, so start' -ForegroundColor Yellow
+    Write-Host '  the utility again once setup finishes.' -ForegroundColor Yellow
 
     $existing = Get-ConfidentialClientConfig
     $replaceOldClientId = ''
