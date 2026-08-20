@@ -17,9 +17,9 @@ param(
     [ValidateRange(0, 10)][int]$TopLevelFolders = 2,
     [ValidateRange(1, 5)][int]$FolderDepth = 3,
     [ValidateRange(0, 3)][int]$SubfoldersPerFolder = 1,
-    [ValidateRange(0, 10)][int]$FilesPerFolder = 2,
-    # Files carrying fabricated sensitive data, capped at FilesPerFolder; the rest hold plain business text.
-    [ValidateRange(0, 10)][int]$SensitiveFilesPerFolder = 1,
+    # Drawn per folder from an inclusive range, so the library is not uniform. A single number pins the count instead.
+    [ValidatePattern('^\s*\d+\s*(-\s*\d+\s*)?$')][string]$FilesPerFolder = '1-4',
+    [ValidatePattern('^\s*\d+\s*(-\s*\d+\s*)?$')][string]$SensitiveFilesPerFolder = '0-2',
     [string]$LogFolder = '',
     [string]$ClientId = '',
     [string]$ApplicationName = 'PnP PowerShell - Label Test Site',
@@ -245,6 +245,45 @@ function Read-CountSetting {
     }
 }
 
+function ConvertTo-CountRange {
+    <# .SYNOPSIS Reads "3" or "1-4" as an inclusive range, or returns nothing when the text cannot be one. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][int]$Minimum,
+        [Parameter(Mandatory)][int]$Maximum
+    )
+
+    $parsed = [regex]::Match($Text.Trim(), '^(\d+)\s*(?:-\s*(\d+))?$')
+    if (-not $parsed.Success) { return $null }
+    $low = [int]$parsed.Groups[1].Value
+    $high = if ($parsed.Groups[2].Success) { [int]$parsed.Groups[2].Value } else { $low }
+    if ($low -gt $high) { $low, $high = $high, $low }
+    if ($low -lt $Minimum -or $high -gt $Maximum) { return $null }
+    return [pscustomobject]@{ Minimum = $low; Maximum = $high }
+}
+
+function Read-RangeSetting {
+    <# .SYNOPSIS Proposes a count or a range like 1-4 and accepts only a value inside the allowed bounds. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][string]$Default,
+        [Parameter(Mandatory)][int]$Minimum,
+        [Parameter(Mandatory)][int]$Maximum,
+        [switch]$UseDefault
+    )
+
+    while ($true) {
+        $value = Read-Setting -Prompt "$Prompt, one number or a range within $Minimum-$Maximum" -Default $Default -UseDefault:$UseDefault
+        $range = ConvertTo-CountRange -Text $value -Minimum $Minimum -Maximum $Maximum
+        if ($null -ne $range) { return $range }
+        # A supplied value is wrong rather than mistyped, so it is reported instead of asked for again.
+        if ($UseDefault -or -not (Test-InteractiveHost)) { throw "'$value' is not a whole number, or a range like 1-4, between $Minimum and $Maximum." }
+        Write-Step -Severity Warn -Message "Enter a whole number, or a range like 1-4, between $Minimum and $Maximum."
+    }
+}
+
 function Test-InteractiveHost {
     <# .SYNOPSIS Reports whether this host can prompt, so unattended runs fail fast instead of hanging. #>
     [CmdletBinding()]
@@ -437,6 +476,27 @@ function New-TestFolderTree {
         Add-TestFolderBranch -Paths $paths -ParentPath '' -Depth 1 -MaximumDepth $Depth -Index $index -SubfolderCount $SubfolderCount
     }
     return @($paths)
+}
+
+function New-TestFilePlan {
+    <# .SYNOPSIS Draws how many files, and how many of them sensitive, each folder gets. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$FolderCount,
+        [Parameter(Mandatory)][psobject]$FileRange,
+        [Parameter(Mandatory)][psobject]$SensitiveRange
+    )
+
+    $plan = [System.Collections.Generic.List[psobject]]::new()
+    for ($index = 0; $index -lt $FolderCount; $index++) {
+        $files = Get-Random -Minimum $FileRange.Minimum -Maximum ($FileRange.Maximum + 1)
+        $sensitive = Get-Random -Minimum $SensitiveRange.Minimum -Maximum ($SensitiveRange.Maximum + 1)
+        $plan.Add([pscustomobject]@{
+                FileCount      = $files
+                SensitiveCount = [math]::Min($sensitive, $files)
+            })
+    }
+    return @($plan)
 }
 
 function Add-ZipTextEntry {
@@ -2191,23 +2251,38 @@ try {
 
     Write-Host ''
     Write-Host '  How much test content to create. The proposed amounts are enough to try labeling.' -ForegroundColor Cyan
-    $topLevelFolders = Read-CountSetting -Prompt 'Top-level folders' -Default $TopLevelFolders -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
-    $folderDepth = Read-CountSetting -Prompt 'Folder levels, counting the top one' -Default $FolderDepth -Minimum 1 -Maximum 5 -UseDefault:$AcceptDefaults
-    $subfoldersPerFolder = Read-CountSetting -Prompt 'Subfolders inside each folder' -Default $SubfoldersPerFolder -Minimum 0 -Maximum 3 -UseDefault:$AcceptDefaults
-    $filesPerFolder = Read-CountSetting -Prompt 'Files in each folder, including the library root' -Default $FilesPerFolder -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
-    $sensitiveFilesPerFolder = 0
-    if ($filesPerFolder -gt 0) {
-        $sensitiveDefault = [math]::Min($SensitiveFilesPerFolder, $filesPerFolder)
-        $sensitiveFilesPerFolder = Read-CountSetting -Prompt 'Of those, files holding fabricated sensitive data' -Default $sensitiveDefault -Minimum 0 -Maximum $filesPerFolder -UseDefault:$AcceptDefaults
-    }
+    Write-Host '  Every extra level multiplies the folder count by the number of subfolders, so the totals grow quickly.' -ForegroundColor Gray
+    Write-Host '  File counts are drawn per folder from the range you give, so the library is not uniform.' -ForegroundColor Gray
+    $topLevelFolders = $TopLevelFolders
+    $folderDepth = $FolderDepth
+    $subfoldersPerFolder = $SubfoldersPerFolder
+    $fileRangeText = $FilesPerFolder
+    $sensitiveRangeText = $SensitiveFilesPerFolder
+    $filePlan = @()
+    $plannedFileCount = 0
+    $plannedSensitiveCount = 0
+    while ($true) {
+        # Each answer becomes the next proposal, so an oversized shape only needs the one number changed.
+        $topLevelFolders = Read-CountSetting -Prompt 'Top-level folders' -Default $topLevelFolders -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
+        $folderDepth = Read-CountSetting -Prompt 'Folder levels, counting the top one' -Default $folderDepth -Minimum 1 -Maximum 5 -UseDefault:$AcceptDefaults
+        $subfoldersPerFolder = Read-CountSetting -Prompt 'Subfolders inside each folder' -Default $subfoldersPerFolder -Minimum 0 -Maximum 3 -UseDefault:$AcceptDefaults
+        $fileRange = Read-RangeSetting -Prompt 'Files in each folder, including the library root' -Default $fileRangeText -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
+        $sensitiveRange = Read-RangeSetting -Prompt 'Of those, files holding fabricated sensitive data' -Default $sensitiveRangeText -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
+        $fileRangeText = '{0}-{1}' -f $fileRange.Minimum, $fileRange.Maximum
+        $sensitiveRangeText = '{0}-{1}' -f $sensitiveRange.Minimum, $sensitiveRange.Maximum
 
-    # Wrapped in @() so that asking for no folders still yields an empty array rather than nothing.
-    $script:FolderTree = @(New-TestFolderTree -TopLevelCount $topLevelFolders -Depth $folderDepth -SubfolderCount $subfoldersPerFolder)
-    # The library root holds files too, so it counts as one more folder.
-    $plannedFileCount = ($script:FolderTree.Count + 1) * $filesPerFolder
-    $plannedSensitiveCount = ($script:FolderTree.Count + 1) * $sensitiveFilesPerFolder
-    if ($script:FolderTree.Count -gt $script:MaximumTestFolders -or $plannedFileCount -gt $script:MaximumTestFiles) {
-        throw "Those amounts would create $($script:FolderTree.Count) folders and $plannedFileCount files, above the limit of $script:MaximumTestFolders folders and $script:MaximumTestFiles files for disposable test data. Choose smaller amounts."
+        # Wrapped in @() so that asking for no folders still yields an empty array rather than nothing.
+        $script:FolderTree = @(New-TestFolderTree -TopLevelCount $topLevelFolders -Depth $folderDepth -SubfolderCount $subfoldersPerFolder)
+        # The library root holds files too, so it counts as one more folder.
+        $filePlan = @(New-TestFilePlan -FolderCount ($script:FolderTree.Count + 1) -FileRange $fileRange -SensitiveRange $sensitiveRange)
+        $plannedFileCount = ($filePlan | Measure-Object -Property FileCount -Sum).Sum
+        $plannedSensitiveCount = ($filePlan | Measure-Object -Property SensitiveCount -Sum).Sum
+        if ($script:FolderTree.Count -le $script:MaximumTestFolders -and $plannedFileCount -le $script:MaximumTestFiles) { break }
+
+        $refusal = "$topLevelFolders top-level folders, $folderDepth levels and $subfoldersPerFolder subfolders each come to $($script:FolderTree.Count) folders, which at $fileRangeText files per folder is $plannedFileCount files. That is above the limit of $script:MaximumTestFolders folders and $script:MaximumTestFiles files for disposable test data."
+        if ($AcceptDefaults -or -not (Test-InteractiveHost)) { throw "$refusal Choose smaller amounts." }
+        Write-Step -Severity Warn -Message "$refusal Lowering the levels or the subfolders per folder shrinks it fastest."
+        Write-Host ''
     }
 
     Write-Host ''
@@ -2272,20 +2347,23 @@ try {
     $null = New-Item -ItemType Directory -Path $stagingRoot -Force
     $uploadedCount = 0
     $sensitiveUploadedCount = 0
+    $formatCounts = [ordered]@{ docx = 0; xlsx = 0 }
 
     try {
         $targets = @('') + $script:FolderTree
         $formats = @('docx', 'xlsx')
-        $folderIndex = 0
-        foreach ($relativePath in $targets) {
+        for ($folderIndex = 0; $folderIndex -lt $targets.Count; $folderIndex++) {
+            $relativePath = $targets[$folderIndex]
+            $folderFileCount = $filePlan[$folderIndex].FileCount
+            $folderSensitiveCount = $filePlan[$folderIndex].SensitiveCount
             $folderPath = if ([string]::IsNullOrEmpty($relativePath)) { $script:LibraryUrl } else { "$script:LibraryUrl/$relativePath" }
             $label = if ([string]::IsNullOrEmpty($relativePath)) { 'root' } else { $relativePath }
             $namePart = ($label -replace '[^A-Za-z0-9]+', '-').Trim('-')
 
-            for ($fileNumber = 1; $fileNumber -le $filesPerFolder; $fileNumber++) {
-                # Offset by folder so both formats carry sensitive data even when only one file per folder does.
+            for ($fileNumber = 1; $fileNumber -le $folderFileCount; $fileNumber++) {
+                # Offset by folder so both formats carry sensitive data even where only one file per folder does.
                 $format = $formats[($fileNumber - 1 + $folderIndex) % $formats.Count]
-                $isSensitive = $fileNumber -le $sensitiveFilesPerFolder
+                $isSensitive = $fileNumber -le $folderSensitiveCount
                 $namePrefix = if ($isSensitive) { 'SensitiveDoc' } else { 'TestDoc' }
                 $fileName = "$namePrefix-$namePart-$fileNumber.$format"
                 $localPath = Join-Path $stagingRoot $fileName
@@ -2295,12 +2373,15 @@ try {
                     Add-PnPFile -Path $localPath -Folder $folderPath -ErrorAction Stop
                 }
                 $uploadedCount++
+                $formatCounts[$format]++
                 if ($isSensitive) { $sensitiveUploadedCount++ }
             }
-            if ($filesPerFolder -gt 0) {
-                Write-Step -Message "Uploaded $filesPerFolder $(if ($filesPerFolder -eq 1) { 'file' } else { 'files' }) to: $label"
+            if ($folderFileCount -gt 0) {
+                Write-Step -Message "Uploaded $folderFileCount $(if ($folderFileCount -eq 1) { 'file' } else { 'files' }), $folderSensitiveCount with sensitive data, to: $label"
             }
-            $folderIndex++
+            else {
+                Write-Step -Message "Left empty: $label"
+            }
         }
     }
     finally {
@@ -2308,7 +2389,7 @@ try {
     }
 
     $treeDepth = if ($script:FolderTree.Count -gt 0) { $folderDepth } else { 0 }
-    $formatSummary = if ($uploadedCount -eq 0) { '' } elseif ($filesPerFolder -eq 1) { ' (.docx)' } else { ' (.docx and .xlsx)' }
+    $formatSummary = if ($uploadedCount -eq 0) { '' } else { " ($($formatCounts['docx']) .docx, $($formatCounts['xlsx']) .xlsx)" }
     Write-Host ''
     Write-Host '  Test site ready' -ForegroundColor Cyan
     Write-Step -Severity Good -Message "Site      : $siteUrl"

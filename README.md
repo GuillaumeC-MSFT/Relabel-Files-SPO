@@ -211,11 +211,13 @@ This repo also includes [New-LabelTestSite.ps1](New-LabelTestSite.ps1). It is a 
 
 It is intentionally separate from the labeling utility and is not required for normal use. If you already have a local folder or a managed SharePoint library to test, you can skip this script entirely. It is only meant to create disposable validation data and should not be treated as a production or operational labeling workflow.
 
-How much content it creates is up to you. The defaults are deliberately small, so a run finishes quickly and a first labeling pass is easy to read: 2 top-level folders, 3 levels deep, 1 subfolder inside each folder, and 2 files in every folder including the library root, which is 6 folders and 14 files. Raise `-TopLevelFolders` (0-10), `-FolderDepth` (1-5), `-SubfoldersPerFolder` (0-3), and `-FilesPerFolder` (0-10) for a busier library, or answer the prompts in an interactive run. Files alternate between `.docx` and `.xlsx`, and folder names are drawn from a per-level pool such as `Finance/Reports/Q1`. Amounts that would create more than 250 folders or 1000 files are refused before anything is provisioned.
+How much content it creates is up to you. The defaults are deliberately small, so a run finishes quickly and a first labeling pass is easy to read: 2 top-level folders, 3 levels deep, and 1 subfolder inside each folder, which is 6 folders. Raise `-TopLevelFolders` (0-10), `-FolderDepth` (1-5), and `-SubfoldersPerFolder` (0-3) for a busier library, or answer the prompts in an interactive run. Folder names are drawn from a per-level pool such as `Finance/Reports/Q1`. Remember that every extra level multiplies the folder count by the number of subfolders, so 5 top-level folders, 5 levels, and 2 subfolders each is already 155 folders. Amounts that would create more than 250 folders or 1000 files are refused, and an interactive run asks again rather than ending.
+
+`-FilesPerFolder` takes a range and defaults to `1-4`, so each folder gets its own randomly drawn number of files rather than a uniform count, and some folders can be left empty when the range starts at 0. A single number pins it: `-FilesPerFolder 3` puts exactly three files in every folder. The library root counts as a folder and gets files too. Files alternate between `.docx` and `.xlsx`.
 
 ### Test files that classifiers can detect
 
-Every generated file holds real text rather than a placeholder line, and `-SensitiveFilesPerFolder` (default 1, capped at `-FilesPerFolder`) decides how many of each folder's files carry fabricated sensitive data:
+Every generated file holds real text rather than a placeholder line, and `-SensitiveFilesPerFolder` decides how many of each folder's files carry fabricated sensitive data. It also takes a range and defaults to `0-2`, drawn per folder and never more than that folder's file count, so the library ends up with a natural mix of clean and sensitive folders:
 
 - `SensitiveDoc-*` files contain invented customer records in the spirit of the public sample sets at [dlptest.com](https://dlptest.com/sample-data/): names, US addresses, dates of birth, Social Security numbers, credit card numbers with expiration dates and verification values, bank account and ABA routing numbers, an IBAN, a passport number, a California driver's license number, and an ITIN.
 - `TestDoc-*` files hold plain business text with nothing to match, which is what makes them useful as a control group.
@@ -263,7 +265,7 @@ The normal interactive path can ask for these script settings; installation, aut
 - The SharePoint root URL. `-TenantRootUrl` supplies it outright; a detected or remembered value is an editable default in an interactive run and is accepted automatically with `-AcceptDefaults`. The value can be a full SharePoint URL, an admin or OneDrive host, a `<tenant>.onmicrosoft.com` domain, or just the tenant alias; the scheme is optional.
 - The application-registration decision, skipped when a usable application is found or when `-RegisterApp` or `-ClientId` supplies the decision.
 - The site name and document library name. `-SiteName` and `-LibraryName` set their proposed values; `-AcceptDefaults` accepts them without prompting.
-- How much test content to create: top-level folders, folder levels, subfolders per folder, files per folder, and how many of those files carry fabricated sensitive data. `-TopLevelFolders`, `-FolderDepth`, `-SubfoldersPerFolder`, `-FilesPerFolder`, and `-SensitiveFilesPerFolder` set their proposed values; `-AcceptDefaults` accepts them without prompting.
+- How much test content to create: top-level folders, folder levels, subfolders per folder, files per folder, and how many of those files carry fabricated sensitive data. `-TopLevelFolders`, `-FolderDepth`, `-SubfoldersPerFolder`, `-FilesPerFolder`, and `-SensitiveFilesPerFolder` set their proposed values; the two file settings accept a number or a range such as `1-4`; `-AcceptDefaults` accepts them without prompting.
 - Whether to start `Invoke-PurviewFileLabeling.ps1` after cleanup. `-AcceptDefaults` answers no.
 
 When the host cannot prompt, the helper takes every default and stops immediately if a value it cannot infer is missing, naming the parameter to supply instead of waiting for input. Transient failures such as timeouts, HTTP 429 throttling, and 5xx responses are retried with exponential backoff and honor the server's `Retry-After` header; if the generated site URL is already in use, the next available name is used automatically.
@@ -329,11 +331,11 @@ Keep the generated application, write the log elsewhere, and name the site and l
     -SiteName 'Label Test March' -LibraryName 'Label Test Library' -LogFolder 'C:\Logs'
 ```
 
-Create a larger structure, here 4 top-level folders, 4 levels deep, 2 subfolders inside each folder, and 4 files per folder of which 2 carry fabricated sensitive data:
+Create a larger structure, here 4 top-level folders, 4 levels deep, 2 subfolders inside each folder, and 2 to 6 files per folder of which 1 to 3 carry fabricated sensitive data:
 
 ```powershell
 .\New-LabelTestSite.ps1 -TenantRootUrl 'https://contoso.sharepoint.com' -RegisterApp -AcceptDefaults `
-    -TopLevelFolders 4 -FolderDepth 4 -SubfoldersPerFolder 2 -FilesPerFolder 4 -SensitiveFilesPerFolder 2
+    -TopLevelFolders 4 -FolderDepth 4 -SubfoldersPerFolder 2 -FilesPerFolder '2-6' -SensitiveFilesPerFolder '1-3'
 ```
 
 The helper's generated application has only delegated SharePoint access, so it cannot read file labels in `Invoke-PurviewFileLabeling.ps1` without Graph `Files.Read.All`. It is deleted when provisioning ends unless `-KeepApp` is used. A kept or supplied application is handed over, but the Graph permission must be added and consented before it is sufficient; otherwise the labeling utility offers to register its own read-only application.
