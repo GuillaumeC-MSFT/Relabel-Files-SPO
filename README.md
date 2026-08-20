@@ -62,7 +62,7 @@ az graph-services account create --resource-group <resource-group> `
     --location global --app-id <application-client-id>
 ```
 
-Before that call, the utility installs or upgrades the `graphservices` extension, records the installed extension version, selects the subscription, and registers the `Microsoft.GraphServices` provider with `--wait`. Each step must succeed before resource creation is attempted.
+Before that call, the utility registers the `Microsoft.GraphServices` provider on that subscription with `--wait`, runs the non-mutating preflight, and then installs or upgrades the `graphservices` extension. Each of those must succeed before resource creation is attempted. The installed extension version is also recorded, and is noted as unavailable rather than treated as a failure when it cannot be read. The subscription is passed to every command instead of being selected, so an Azure CLI session that was already open keeps its own default.
 
 If the documented create command reaches Microsoft.GraphServices and comes back with a server-side type-load failure, such as one naming `OpenTelemetry` and `TryCreateLogger`, the utility reports it as a server-side error rather than a subscription, tenant, resource-group, or authorization problem. When that subscription's provider metadata advertises Microsoft's published `2022-09-22-preview` contract, the utility offers one explicit recovery choice. Acceptance sends one direct `az resource create` PUT with that API version, the same subscription, resource group, resource name, and application ID, and `location` still set to `global`. It does not export a token, use a template deployment, or create another application, certificate, group, or billing-resource name.
 
@@ -198,7 +198,7 @@ The utility retrieves sensitivity labels directly from the customer's tenant. If
 1. Import `ExchangeOnlineManagement`.
 2. Open an interactive browser sign-in with `Connect-IPPSSession`.
 3. Run `Get-Label` and list enabled labels that can apply to files.
-4. Show the friendly label name, tenant priority, and GUID in a numbered menu.
+4. Show the friendly label name and tenant priority in a numbered menu. The GUID is not shown in the menu; the selected one is written to the run log.
 5. Use the selected GUID automatically with `Set-FileLabel`.
 
 Parent labels or label groups that contain child labels are excluded because they are not valid file-labeling choices. Sublabels are displayed as `Parent \ Child` and the child GUID is used.

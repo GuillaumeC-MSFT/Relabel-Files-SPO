@@ -281,6 +281,8 @@ function Read-RangeSetting {
         # A supplied value is wrong rather than mistyped, so it is reported instead of asked for again.
         if ($UseDefault -or -not (Test-InteractiveHost)) { throw "'$value' is not a whole number, or a range like 1-4, between $Minimum and $Maximum." }
         Write-Step -Severity Warn -Message "Enter a whole number, or a range like 1-4, between $Minimum and $Maximum."
+        # Proposing the full range next keeps Enter from repeating a value that was just refused.
+        $Default = "$Minimum-$Maximum"
     }
 }
 
@@ -2093,6 +2095,7 @@ if (-not $NoRelaunch -and $PSVersionTable.PSVersion -lt [version]'7.2.0') {
 Write-Host ''
 Write-Host '  SharePoint Online label test-data provisioner' -ForegroundColor Cyan
 Write-Host '  Creates a new site, a document library, nested folders, and labelable files.' -ForegroundColor Gray
+Write-Host '  Some files hold fabricated personal and payment data so classifiers have something to detect.' -ForegroundColor Gray
 Write-Host '  This helper is optional and only for validation. It is not required for normal file labeling.' -ForegroundColor Gray
 Write-Host ''
 
