@@ -3,7 +3,8 @@
 <#
 .SYNOPSIS
     Creates a SharePoint Online test site with a document library, a nested folder
-    hierarchy, and real Office files that Microsoft Purview can label.
+    hierarchy, and real Office files that Microsoft Purview can label. The amount of
+    test content defaults to a small set and is adjustable.
 #>
 
 [CmdletBinding()]
@@ -12,6 +13,13 @@ param(
     [string]$TenantHint = '',
     [string]$SiteName = '',
     [string]$LibraryName = '',
+    # The defaults make a small tree that is quick to provision and quick to label; raise them for a busier library.
+    [ValidateRange(0, 10)][int]$TopLevelFolders = 2,
+    [ValidateRange(1, 5)][int]$FolderDepth = 3,
+    [ValidateRange(0, 3)][int]$SubfoldersPerFolder = 1,
+    [ValidateRange(0, 10)][int]$FilesPerFolder = 2,
+    # Files carrying fabricated sensitive data, capped at FilesPerFolder; the rest hold plain business text.
+    [ValidateRange(0, 10)][int]$SensitiveFilesPerFolder = 1,
     [string]$LogFolder = '',
     [string]$ClientId = '',
     [string]$ApplicationName = 'PnP PowerShell - Label Test Site',
@@ -44,16 +52,70 @@ $script:CreatedApplication = $null
 # Set only when the operator asks for the labeling utility to run once provisioning finishes.
 $script:LaunchLabelingPath = ''
 
-# Folders are created in order, so each parent exists before its child.
-$script:FolderTree = @(
-    'Finance'
-    'Finance/Reports'
-    'Finance/Reports/Q1'
-    'Finance/Reports/Q1/Archive'
-    'HR'
-    'HR/Policies'
-    'HR/Policies/Current'
+# Built from the requested counts, parents first, so each parent exists before its child.
+$script:FolderTree = @()
+# One name pool per depth level, so a generated tree still reads like a real library.
+$script:FolderNamesByDepth = @(
+    @('Finance', 'HR', 'Legal', 'Operations', 'Marketing', 'Sales', 'Facilities', 'Research', 'Support', 'Projects'),
+    @('Reports', 'Policies', 'Contracts', 'Budgets', 'Plans', 'Records'),
+    @('Q1', 'Q2', 'Q3', 'Q4', 'Annual', 'Monthly'),
+    @('Archive', 'Drafts', 'Final', 'Working', 'Review', 'Shared'),
+    @('2023', '2024', '2025', 'Signed', 'Superseded', 'Reference')
 )
+# Fabricated records shaped like the public sample sets at dlptest.com, so Purview classifiers have something to match.
+# Each value pairs a valid pattern with a keyword from that SIT's documented supporting list, because most SITs need both within 300 characters.
+# The card numbers pass the Luhn test but are not the reserved numbers that the credit card SIT deliberately ignores.
+$script:SensitiveSampleRecords = @(
+    @(
+        'Customer record - payroll onboarding'
+        'Full name: Jane A. Doe'
+        'Home address: 4120 Maple Avenue, Redmond, WA 98052'
+        'Date of birth: 11 March 1974'
+        'Social Security Number (SSN): 539-95-4188'
+        'Credit card number (Visa): 4539 1488 0343 6467'
+        'Card expiration date: 04/2028'
+        'Card verification value (CVV2): 731'
+        'Email: jane.doe@contoso.com'
+        'Phone: +1 (425) 555-0142'
+    ),
+    @(
+        'Customer record - account verification'
+        'Full name: Miguel R. Santos'
+        'Home address: 88 Belmont Street, Boston, MA 02116'
+        'Date of birth: 02 September 1986'
+        'Social Security Number (SSN): 412-33-7291'
+        'Bank account number: 493042798132'
+        'ABA routing number: 121000358'
+        'IBAN: GB82WEST12345698765432'
+        'Email: miguel.santos@contoso.com'
+    ),
+    @(
+        'Customer record - card dispute'
+        'Full name: Priya N. Raman'
+        'Billing address: 1701 Harbor Drive, Seattle, WA 98101'
+        'Credit card number (Mastercard): 5412 7412 3456 7899'
+        'Card expiration date: 11/2027'
+        'Card verification value (CVV2): 204'
+        'Credit card number (American Express): 3765 010234 56786'
+        'Social Security Number (SSN): 205-64-8813'
+        'Phone: +1 (206) 555-0173'
+    ),
+    @(
+        'Customer record - identity check'
+        'Full name: Thomas L. Berger'
+        'Home address: 2200 Alameda Street, San Jose, CA 95112'
+        'Date of birth: 24 December 1969'
+        'US passport number: 340025519'
+        'Driver''s license number (California DL): I1234562'
+        'Individual Taxpayer Identification Number (ITIN): 912-73-4567'
+        'Credit card number (Discover): 6011 2345 6789 0123'
+        'Card expiration date: 08/2029'
+        'Email: thomas.berger@contoso.com'
+    )
+)
+# Test data is disposable, so a shape that would take hours to provision is refused instead of started.
+$script:MaximumTestFolders = 250
+$script:MaximumTestFiles = 1000
 
 function Add-LogEntry {
     <# .SYNOPSIS Records one action in the run log, buffering until the log file exists. #>
@@ -160,6 +222,27 @@ function Read-Setting {
     $value = $value.Trim()
     Add-LogEntry -Message "${Prompt}: $value"
     return $value
+}
+
+function Read-CountSetting {
+    <# .SYNOPSIS Proposes a count and accepts only a whole number inside the allowed range. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [Parameter(Mandatory)][int]$Default,
+        [Parameter(Mandatory)][int]$Minimum,
+        [Parameter(Mandatory)][int]$Maximum,
+        [switch]$UseDefault
+    )
+
+    while ($true) {
+        $value = Read-Setting -Prompt "$Prompt ($Minimum-$Maximum)" -Default ([string]$Default) -UseDefault:$UseDefault
+        $parsed = 0
+        if ([int]::TryParse($value, [ref]$parsed) -and $parsed -ge $Minimum -and $parsed -le $Maximum) { return $parsed }
+        Write-Step -Severity Warn -Message "Enter a whole number between $Minimum and $Maximum."
+        # A non-interactive host cannot correct itself, and the proposed value is always inside the range.
+        if ($UseDefault -or -not (Test-InteractiveHost)) { return $Default }
+    }
 }
 
 function Test-InteractiveHost {
@@ -301,6 +384,61 @@ function ConvertTo-UrlSlug {
     return $slug
 }
 
+function Get-TestFolderName {
+    <# .SYNOPSIS Picks the name for one folder from the pool for its depth. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][int]$Index
+    )
+
+    # Wrapped in @() because a one-name fallback pool would otherwise arrive as a bare string.
+    $pool = @(if ($Depth -le $script:FolderNamesByDepth.Count) { $script:FolderNamesByDepth[$Depth - 1] } else { "Level$Depth" })
+    $name = $pool[($Index - 1) % $pool.Count]
+    # Past the end of the pool the names repeat, so a suffix keeps siblings unique.
+    $round = [math]::Floor(($Index - 1) / $pool.Count)
+    if ($round -gt 0) { $name = '{0}-{1}' -f $name, ($round + 1) }
+    return $name
+}
+
+function Add-TestFolderBranch {
+    <# .SYNOPSIS Appends one folder and everything beneath it, parent before child. #>
+    [CmdletBinding()]
+    param(
+        # The list starts out empty, which a mandatory parameter otherwise rejects.
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[string]]$Paths,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$ParentPath,
+        [Parameter(Mandatory)][int]$Depth,
+        [Parameter(Mandatory)][int]$MaximumDepth,
+        [Parameter(Mandatory)][int]$Index,
+        [Parameter(Mandatory)][int]$SubfolderCount
+    )
+
+    $name = Get-TestFolderName -Depth $Depth -Index $Index
+    $path = if ($ParentPath) { "$ParentPath/$name" } else { $name }
+    $Paths.Add($path)
+    if ($Depth -ge $MaximumDepth) { return }
+    for ($child = 1; $child -le $SubfolderCount; $child++) {
+        Add-TestFolderBranch -Paths $Paths -ParentPath $path -Depth ($Depth + 1) -MaximumDepth $MaximumDepth -Index $child -SubfolderCount $SubfolderCount
+    }
+}
+
+function New-TestFolderTree {
+    <# .SYNOPSIS Builds the library-relative folder paths to create, in creation order. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateRange(0, 100)][int]$TopLevelCount,
+        [Parameter(Mandatory)][ValidateRange(1, 10)][int]$Depth,
+        [Parameter(Mandatory)][ValidateRange(0, 20)][int]$SubfolderCount
+    )
+
+    $paths = [System.Collections.Generic.List[string]]::new()
+    for ($index = 1; $index -le $TopLevelCount; $index++) {
+        Add-TestFolderBranch -Paths $paths -ParentPath '' -Depth 1 -MaximumDepth $Depth -Index $index -SubfolderCount $SubfolderCount
+    }
+    return @($paths)
+}
+
 function Add-ZipTextEntry {
     <# .SYNOPSIS Adds one UTF-8 XML part to an open OOXML package. #>
     [CmdletBinding()]
@@ -319,18 +457,59 @@ function Add-ZipTextEntry {
     finally { $stream.Dispose() }
 }
 
+function Get-TestFileContent {
+    <# .SYNOPSIS Builds the body of one test file, seeded with fabricated sensitive data when asked. #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FolderLabel,
+        [Parameter(Mandatory)][int]$FileNumber,
+        [switch]$IncludeSensitiveData
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('Contoso Ltd - Microsoft Purview sensitivity label test file')
+    $lines.Add("Library folder: $FolderLabel    Item: $FileNumber")
+    $lines.Add("Created by New-LabelTestSite.ps1 on $(Get-Date -Format 'yyyy-MM-dd HH:mm')")
+    $lines.Add('')
+
+    if (-not $IncludeSensitiveData) {
+        $lines.Add('This file holds ordinary business text and nothing a classifier should match. Use it to confirm that a label applied by hand or by policy also reaches unremarkable content, and that automatic policies leave it alone.')
+        $lines.Add('')
+        $lines.Add('Quarterly review notes')
+        $lines.Add('1. Confirm the reporting calendar with each regional lead.')
+        $lines.Add('2. Publish the consolidated figures to the finance workspace.')
+        $lines.Add('3. Archive the previous quarter working files.')
+        $lines.Add('4. Book the follow-up session for the operations team.')
+        $lines.Add('')
+        $lines.Add('Status: open. Owner: the review team. No customer or personal data is stored in this file.')
+        return @($lines)
+    }
+
+    $records = @($script:SensitiveSampleRecords)
+    $record = @($records[($FileNumber - 1) % $records.Count])
+    $lines.Add('CONFIDENTIAL - fabricated personal and payment data for classifier testing.')
+    $lines.Add('Every value below is invented for testing, in the spirit of the public sample sets at dlptest.com. None of it identifies a real person, account, or payment card.')
+    $lines.Add('It contains a social security number, credit card number, bank account number, passport number, driver''s license number, and taxpayer identification number, each written next to its keyword so Purview sensitive information types can match both the pattern and its supporting evidence.')
+    $lines.Add('')
+    foreach ($recordLine in $record) { $lines.Add($recordLine) }
+    $lines.Add('')
+    $lines.Add('Handling: restricted customer file. Do not distribute outside the review team.')
+    return @($lines)
+}
+
 function New-TestOfficeFile {
-    <# .SYNOPSIS Writes a minimal but valid .docx or .xlsx that Purview can label. #>
+    <# .SYNOPSIS Writes a minimal but valid .docx or .xlsx that Purview can read and label. #>
     [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][ValidateSet('docx', 'xlsx')][string]$Format,
-        [Parameter(Mandatory)][string]$Text
+        # Blank lines are deliberate spacing, which a mandatory parameter otherwise rejects.
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Line
     )
 
     if (-not $PSCmdlet.ShouldProcess($Path, "Create test $Format")) { return }
 
-    $encodedText = [System.Security.SecurityElement]::Escape($Text)
+    $encodedLines = @($Line | ForEach-Object { [System.Security.SecurityElement]::Escape([string]$_) })
     $relationshipsNs = 'http://schemas.openxmlformats.org/package/2006/relationships'
     $officeDocumentType = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument'
 
@@ -354,7 +533,9 @@ function New-TestOfficeFile {
                 Add-ZipTextEntry -Archive $archive -EntryName 'word/document.xml' -Content (
                     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
                     '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">' +
-                    "<w:body><w:p><w:r><w:t>$encodedText</w:t></w:r></w:p></w:body>" +
+                    '<w:body>' +
+                    (($encodedLines | ForEach-Object { "<w:p><w:r><w:t xml:space=`"preserve`">$_</w:t></w:r></w:p>" }) -join '') +
+                    '</w:body>' +
                     '</w:document>')
             }
             else {
@@ -381,10 +562,13 @@ function New-TestOfficeFile {
                     "<Relationships xmlns=`"$relationshipsNs`">" +
                     '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
                     '</Relationships>')
+                $rows = for ($rowNumber = 1; $rowNumber -le $encodedLines.Count; $rowNumber++) {
+                    "<row r=`"$rowNumber`"><c r=`"A$rowNumber`" t=`"inlineStr`"><is><t xml:space=`"preserve`">$($encodedLines[$rowNumber - 1])</t></is></c></row>"
+                }
                 Add-ZipTextEntry -Archive $archive -EntryName 'xl/worksheets/sheet1.xml' -Content (
                     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
                     '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
-                    "<sheetData><row r=`"1`"><c r=`"A1`" t=`"inlineStr`"><is><t>$encodedText</t></is></c></row></sheetData>" +
+                    "<sheetData>$($rows -join '')</sheetData>" +
                     '</worksheet>')
             }
         }
@@ -2006,7 +2190,29 @@ try {
     $script:LibraryUrl = ConvertTo-UrlSlug -Name $script:LibraryTitle
 
     Write-Host ''
+    Write-Host '  How much test content to create. The proposed amounts are enough to try labeling.' -ForegroundColor Cyan
+    $topLevelFolders = Read-CountSetting -Prompt 'Top-level folders' -Default $TopLevelFolders -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
+    $folderDepth = Read-CountSetting -Prompt 'Folder levels, counting the top one' -Default $FolderDepth -Minimum 1 -Maximum 5 -UseDefault:$AcceptDefaults
+    $subfoldersPerFolder = Read-CountSetting -Prompt 'Subfolders inside each folder' -Default $SubfoldersPerFolder -Minimum 0 -Maximum 3 -UseDefault:$AcceptDefaults
+    $filesPerFolder = Read-CountSetting -Prompt 'Files in each folder, including the library root' -Default $FilesPerFolder -Minimum 0 -Maximum 10 -UseDefault:$AcceptDefaults
+    $sensitiveFilesPerFolder = 0
+    if ($filesPerFolder -gt 0) {
+        $sensitiveDefault = [math]::Min($SensitiveFilesPerFolder, $filesPerFolder)
+        $sensitiveFilesPerFolder = Read-CountSetting -Prompt 'Of those, files holding fabricated sensitive data' -Default $sensitiveDefault -Minimum 0 -Maximum $filesPerFolder -UseDefault:$AcceptDefaults
+    }
+
+    # Wrapped in @() so that asking for no folders still yields an empty array rather than nothing.
+    $script:FolderTree = @(New-TestFolderTree -TopLevelCount $topLevelFolders -Depth $folderDepth -SubfolderCount $subfoldersPerFolder)
+    # The library root holds files too, so it counts as one more folder.
+    $plannedFileCount = ($script:FolderTree.Count + 1) * $filesPerFolder
+    $plannedSensitiveCount = ($script:FolderTree.Count + 1) * $sensitiveFilesPerFolder
+    if ($script:FolderTree.Count -gt $script:MaximumTestFolders -or $plannedFileCount -gt $script:MaximumTestFiles) {
+        throw "Those amounts would create $($script:FolderTree.Count) folders and $plannedFileCount files, above the limit of $script:MaximumTestFolders folders and $script:MaximumTestFiles files for disposable test data. Choose smaller amounts."
+    }
+
+    Write-Host ''
     Write-Step -Message "Library         : $script:LibraryTitle"
+    Write-Step -Message "Test content    : $($script:FolderTree.Count) folders, $plannedFileCount files, $plannedSensitiveCount of them with fabricated sensitive data"
     Write-Host ''
 
     $siteUrl = ''
@@ -2065,38 +2271,58 @@ try {
     $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("LabelTestFiles-" + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $stagingRoot -Force
     $uploadedCount = 0
+    $sensitiveUploadedCount = 0
 
     try {
         $targets = @('') + $script:FolderTree
+        $formats = @('docx', 'xlsx')
+        $folderIndex = 0
         foreach ($relativePath in $targets) {
             $folderPath = if ([string]::IsNullOrEmpty($relativePath)) { $script:LibraryUrl } else { "$script:LibraryUrl/$relativePath" }
             $label = if ([string]::IsNullOrEmpty($relativePath)) { 'root' } else { $relativePath }
             $namePart = ($label -replace '[^A-Za-z0-9]+', '-').Trim('-')
 
-            foreach ($format in 'docx', 'xlsx') {
-                $fileName = "TestDoc-$namePart.$format"
+            for ($fileNumber = 1; $fileNumber -le $filesPerFolder; $fileNumber++) {
+                # Offset by folder so both formats carry sensitive data even when only one file per folder does.
+                $format = $formats[($fileNumber - 1 + $folderIndex) % $formats.Count]
+                $isSensitive = $fileNumber -le $sensitiveFilesPerFolder
+                $namePrefix = if ($isSensitive) { 'SensitiveDoc' } else { 'TestDoc' }
+                $fileName = "$namePrefix-$namePart-$fileNumber.$format"
                 $localPath = Join-Path $stagingRoot $fileName
-                New-TestOfficeFile -Path $localPath -Format $format -Text "Purview label test file for $label." -Confirm:$false
+                $content = Get-TestFileContent -FolderLabel $label -FileNumber $fileNumber -IncludeSensitiveData:$isSensitive
+                New-TestOfficeFile -Path $localPath -Format $format -Line $content -Confirm:$false
                 $null = Invoke-WithRetry -Description "Upload of $fileName" -Operation {
                     Add-PnPFile -Path $localPath -Folder $folderPath -ErrorAction Stop
                 }
                 $uploadedCount++
+                if ($isSensitive) { $sensitiveUploadedCount++ }
             }
-            Write-Step -Message "Uploaded 2 files to: $label"
+            if ($filesPerFolder -gt 0) {
+                Write-Step -Message "Uploaded $filesPerFolder $(if ($filesPerFolder -eq 1) { 'file' } else { 'files' }) to: $label"
+            }
+            $folderIndex++
         }
     }
     finally {
         Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    $treeDepth = if ($script:FolderTree.Count -gt 0) { $folderDepth } else { 0 }
+    $formatSummary = if ($uploadedCount -eq 0) { '' } elseif ($filesPerFolder -eq 1) { ' (.docx)' } else { ' (.docx and .xlsx)' }
     Write-Host ''
     Write-Host '  Test site ready' -ForegroundColor Cyan
     Write-Step -Severity Good -Message "Site      : $siteUrl"
     Write-Step -Severity Good -Message "Library   : $siteUrl/$script:LibraryUrl"
-    Write-Step -Severity Good -Message "Folders   : $($script:FolderTree.Count) (4 levels deep)"
-    Write-Step -Severity Good -Message "Files     : $uploadedCount (.docx and .xlsx)"
+    Write-Step -Severity Good -Message "Folders   : $($script:FolderTree.Count) ($treeDepth levels deep)"
+    Write-Step -Severity Good -Message "Files     : $uploadedCount$formatSummary"
+    if ($sensitiveUploadedCount -gt 0) {
+        Write-Step -Severity Good -Message "Sensitive : $sensitiveUploadedCount named SensitiveDoc-*, holding fabricated SSNs, card numbers, and bank details next to the keywords those classifiers look for"
+    }
     Write-Host ''
     Write-Step -Message 'Every file starts with no sensitivity label, so a first labeling run reports them all as changeable. To exercise the rule that protects an existing higher label, label a few files by hand and run it again.'
+    if ($sensitiveUploadedCount -gt 0) {
+        Write-Step -Message 'The SensitiveDoc-* files give auto-labeling, DLP, and content explorer something to detect, while the TestDoc-* files are deliberately plain. Classification is not instant, so allow time for the service to crawl the new library.'
+    }
     Write-Host ''
     # Handing the application over only helps when it still exists after this run has cleaned up.
     $applicationSurvives = ($null -eq $script:CreatedApplication) -or $KeepApp

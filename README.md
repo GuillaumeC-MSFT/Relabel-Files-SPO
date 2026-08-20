@@ -211,6 +211,19 @@ This repo also includes [New-LabelTestSite.ps1](New-LabelTestSite.ps1). It is a 
 
 It is intentionally separate from the labeling utility and is not required for normal use. If you already have a local folder or a managed SharePoint library to test, you can skip this script entirely. It is only meant to create disposable validation data and should not be treated as a production or operational labeling workflow.
 
+How much content it creates is up to you. The defaults are deliberately small, so a run finishes quickly and a first labeling pass is easy to read: 2 top-level folders, 3 levels deep, 1 subfolder inside each folder, and 2 files in every folder including the library root, which is 6 folders and 14 files. Raise `-TopLevelFolders` (0-10), `-FolderDepth` (1-5), `-SubfoldersPerFolder` (0-3), and `-FilesPerFolder` (0-10) for a busier library, or answer the prompts in an interactive run. Files alternate between `.docx` and `.xlsx`, and folder names are drawn from a per-level pool such as `Finance/Reports/Q1`. Amounts that would create more than 250 folders or 1000 files are refused before anything is provisioned.
+
+### Test files that classifiers can detect
+
+Every generated file holds real text rather than a placeholder line, and `-SensitiveFilesPerFolder` (default 1, capped at `-FilesPerFolder`) decides how many of each folder's files carry fabricated sensitive data:
+
+- `SensitiveDoc-*` files contain invented customer records in the spirit of the public sample sets at [dlptest.com](https://dlptest.com/sample-data/): names, US addresses, dates of birth, Social Security numbers, credit card numbers with expiration dates and verification values, bank account and ABA routing numbers, an IBAN, a passport number, a California driver's license number, and an ITIN.
+- `TestDoc-*` files hold plain business text with nothing to match, which is what makes them useful as a control group.
+
+A [sensitive information type](https://learn.microsoft.com/en-us/purview/sit-sensitive-information-type-learn-about) normally needs a primary element **and** supporting evidence within about 300 characters, so each value is written next to a keyword from that type's documented list, such as `Social Security Number (SSN): ...`, `Credit card number (Visa): ...`, `Card expiration date: ...`, `Card verification value (CVV2): ...`, `ABA routing number: ...`, and `US passport number: ...`. Values that carry a checksum pass it: the card numbers pass the Luhn test, the routing number passes the ABA check, and the IBAN passes its mod-97 check. The card numbers are deliberately **not** the reserved test numbers such as `4111 1111 1111 1111`, because the credit card type ignores those by design. Nothing in these files refers to a real person, account, or card, and the phone numbers use the reserved `555-01xx` range.
+
+Classification is not immediate. Allow the service time to crawl the new library before expecting auto-labeling policies, DLP policy matches, or content explorer to show results.
+
 ### Handing straight over to the labeling utility
 
 When provisioning finishes, the helper remembers the site URL and library name it just created in `PURVIEW_FILE_LABELING_SITE_URL` and `PURVIEW_FILE_LABELING_LIBRARY`, so `Invoke-PurviewFileLabeling.ps1` proposes both as defaults: press Enter at the site prompt, and the new library is already the highlighted choice in the library menu.
@@ -240,7 +253,7 @@ foreach ($target in [EnvironmentVariableTarget]::Process, [EnvironmentVariableTa
 
 The helper focuses on validation, not production labeling. It creates a disposable SharePoint site and library so that the label experience can be tested without affecting live content. It is designed to run with as little input as possible: the tenant, admin URL, cloud, and application are discovered automatically, and the validated root URL is remembered in `LABEL_TEST_SITE_TENANT_URL` so later runs need no typed input.
 
-Every prompt with a sensible default proposes it in brackets, and values can be supplied up front with `-LogFolder`, `-SiteName`, and `-LibraryName`. Pass `-AcceptDefaults` to take every proposed value without being asked.
+Every prompt with a sensible default proposes it in brackets, and values can be supplied up front with `-LogFolder`, `-SiteName`, `-LibraryName`, `-TopLevelFolders`, `-FolderDepth`, `-SubfoldersPerFolder`, `-FilesPerFolder`, and `-SensitiveFilesPerFolder`. Pass `-AcceptDefaults` to take every proposed value without being asked.
 
 The helper writes every action to a timestamped `New-LabelTestSite-*.log` in the log folder, which defaults to the script directory. The log records the host and Windows user, each resolved value, each script prompt and answer, every site, folder, and file created, every warning and error, and the outcome of application cleanup. Lines recorded before the log file exists are buffered and flushed into it, so the log is complete even when the folder is chosen interactively. If the file cannot be created, the helper reports that the run is logged to the console only; otherwise, the log path is printed again on exit.
 
@@ -250,6 +263,7 @@ The normal interactive path can ask for these script settings; installation, aut
 - The SharePoint root URL. `-TenantRootUrl` supplies it outright; a detected or remembered value is an editable default in an interactive run and is accepted automatically with `-AcceptDefaults`. The value can be a full SharePoint URL, an admin or OneDrive host, a `<tenant>.onmicrosoft.com` domain, or just the tenant alias; the scheme is optional.
 - The application-registration decision, skipped when a usable application is found or when `-RegisterApp` or `-ClientId` supplies the decision.
 - The site name and document library name. `-SiteName` and `-LibraryName` set their proposed values; `-AcceptDefaults` accepts them without prompting.
+- How much test content to create: top-level folders, folder levels, subfolders per folder, files per folder, and how many of those files carry fabricated sensitive data. `-TopLevelFolders`, `-FolderDepth`, `-SubfoldersPerFolder`, `-FilesPerFolder`, and `-SensitiveFilesPerFolder` set their proposed values; `-AcceptDefaults` accepts them without prompting.
 - Whether to start `Invoke-PurviewFileLabeling.ps1` after cleanup. `-AcceptDefaults` answers no.
 
 When the host cannot prompt, the helper takes every default and stops immediately if a value it cannot infer is missing, naming the parameter to supply instead of waiting for input. Transient failures such as timeouts, HTTP 429 throttling, and 5xx responses are retried with exponential backoff and honor the server's `Retry-After` header; if the generated site URL is already in use, the next available name is used automatically.
@@ -313,6 +327,13 @@ Keep the generated application, write the log elsewhere, and name the site and l
 ```powershell
 .\New-LabelTestSite.ps1 -TenantRootUrl 'https://contoso.sharepoint.com' -RegisterApp -KeepApp `
     -SiteName 'Label Test March' -LibraryName 'Label Test Library' -LogFolder 'C:\Logs'
+```
+
+Create a larger structure, here 4 top-level folders, 4 levels deep, 2 subfolders inside each folder, and 4 files per folder of which 2 carry fabricated sensitive data:
+
+```powershell
+.\New-LabelTestSite.ps1 -TenantRootUrl 'https://contoso.sharepoint.com' -RegisterApp -AcceptDefaults `
+    -TopLevelFolders 4 -FolderDepth 4 -SubfoldersPerFolder 2 -FilesPerFolder 4 -SensitiveFilesPerFolder 2
 ```
 
 The helper's generated application has only delegated SharePoint access, so it cannot read file labels in `Invoke-PurviewFileLabeling.ps1` without Graph `Files.Read.All`. It is deleted when provisioning ends unless `-KeepApp` is used. A kept or supplied application is handed over, but the Graph permission must be added and consented before it is sufficient; otherwise the labeling utility offers to register its own read-only application.
