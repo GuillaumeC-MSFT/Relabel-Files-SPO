@@ -58,12 +58,15 @@ $script:Failures = [System.Collections.Generic.List[object]]::new()
 $script:RejectedClientIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 # Anything registered during this run may still be replicating, so it is never treated as stale.
 $script:SessionSavedClientIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$script:OfficeFileExtensions = @(
+# Everything the Purview Information Protection client can label on disk, per its supported file types.
+$script:ClientFileExtensions = @(
     '.doc', '.docm', '.docx', '.dot', '.dotm', '.dotx',
-    '.xls', '.xlsb', '.xlsm', '.xlsx', '.xlt', '.xltm', '.xltx',
-    '.ppt', '.pptm', '.pptx', '.pot', '.potm', '.potx',
-    '.vsd', '.vsdm', '.vsdx', '.pdf'
+    '.xls', '.xlsb', '.xlsm', '.xlsx', '.xltm', '.xltx',
+    '.ppt', '.pps', '.ppsm', '.ppsx', '.potm', '.potx', '.pptm', '.pptx',
+    '.vsd', '.vsdm', '.vsdx', '.vss', '.vssm', '.vssx', '.vst', '.vstm', '.vstx', '.vdw', '.pdf'
 )
+# SharePoint applies labels to a much shorter list than the client does, and .pdf needs the tenant PDF opt-in.
+$script:SharePointFileExtensions = @('.docx', '.docm', '.xlsx', '.xlsm', '.xlsb', '.pptx', '.ppsx', '.pdf')
 $script:ModernFileExtensions = @('.docx', '.xlsx', '.pptx', '.pdf')
 $script:FilesSinceCollection = 0
 $script:UseDeviceCode = [bool]$DeviceLogin
@@ -2929,7 +2932,7 @@ function Read-RunSetting {
     }
 
     $includeSubfolders = (Read-MenuChoice -Title 'Include subfolders?' -Options ([ordered]@{'1' = 'No'; '2' = 'Yes'}) -Default '1') -eq '2'
-    $extensions = Read-FileExtension
+    $extensions = Read-FileExtension -Source $Source
 
     $labelOptions = [ordered]@{}
     for ($index = 0; $index -lt $Labels.Count; $index++) {
@@ -3019,22 +3022,49 @@ function ConvertTo-ExtensionList {
 }
 
 function Read-FileExtension {
-    <# .SYNOPSIS Offers the ready-made Office file sets, or a typed list. #>
+    <# .SYNOPSIS Offers the file sets the chosen source can actually label, or a typed list. #>
     [CmdletBinding()]
-    param()
+    param([Parameter(Mandatory)][ValidateSet('Local', 'SharePoint')][string]$Source)
+
+    if ($Source -eq 'SharePoint') {
+        $supported = @($script:SharePointFileExtensions)
+        $wideChoice = 'Every format SharePoint can label: ' + ($script:SharePointFileExtensions -join ' ')
+        Write-Host ''
+        Write-Host '  SharePoint labels a shorter list of formats than the Purview client does.' -ForegroundColor Gray
+        Write-Host '  Legacy (.doc .xls .ppt), template, and Visio files cannot be labeled there,' -ForegroundColor Gray
+        Write-Host '  and .pdf works only where the tenant enabled sensitivity labels for PDF.' -ForegroundColor Gray
+    }
+    else {
+        $supported = @($script:ClientFileExtensions)
+        $wideChoice = 'All Office documents, Visio drawings, and PDF, including legacy and macro-enabled formats'
+    }
 
     while ($true) {
         $choice = Read-MenuChoice -Title 'Which files should be scanned?' -Options ([ordered]@{
-                '1' = 'All Office documents and PDF, including legacy and macro-enabled formats'
+                '1' = $wideChoice
                 '2' = 'Current Office formats only: .docx .xlsx .pptx .pdf'
                 '3' = 'Type my own list'
             }) -Default '1'
-        if ($choice -eq '1') { return @($script:OfficeFileExtensions) }
+        if ($choice -eq '1') { return @($supported) }
         if ($choice -eq '2') { return @($script:ModernFileExtensions) }
 
         $extensions = ConvertTo-ExtensionList -Text (Read-ValueWithDefault -Prompt 'File extensions, comma-separated' -Default ($script:ModernFileExtensions -join ','))
-        if ($extensions.Count -gt 0) { return @($extensions) }
-        Write-RunLog -Severity WARN -Action 'Validate file filters' -Result 'At least one extension is required.'
+        if ($extensions.Count -eq 0) {
+            Write-RunLog -Severity WARN -Action 'Validate file filters' -Result 'At least one extension is required.'
+            continue
+        }
+        # Scanning an unlabelable type is allowed, because only the write fails, but on SharePoint that write still costs.
+        $unsupported = @($extensions | Where-Object { $supported -notcontains $_ })
+        if ($unsupported.Count -gt 0) {
+            $consequence = if ($Source -eq 'SharePoint') {
+                'SharePoint refuses to label these, and in apply mode each refusal is still a metered API call'
+            }
+            else {
+                'the Purview client cannot label these'
+            }
+            Write-RunLog -Severity WARN -Action 'Validate file filters' -Result "$($unsupported -join ' '): $consequence. They are still listed by the scan."
+        }
+        return @($extensions)
     }
 }
 
@@ -3191,7 +3221,7 @@ function Invoke-BatchRun {
 
     Write-Host ''
     Write-Host '  Rows that leave Extensions empty fall back to this choice.' -ForegroundColor Gray
-    $defaultExtensions = Read-FileExtension
+    $defaultExtensions = Read-FileExtension -Source $Source
 
     Write-Host ''
     Write-Host '  The CSV needs a Folder column and a Label column. Recurse and Extensions' -ForegroundColor Gray
