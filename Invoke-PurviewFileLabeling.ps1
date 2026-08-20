@@ -5485,10 +5485,10 @@ function Invoke-MeteredSetup {
     Write-Host '  including GCC.' -ForegroundColor Yellow
     Write-Host ''
     Write-Host '  Microsoft classes assignSensitivityLabel as a protected API, which means it' -ForegroundColor Yellow
-    Write-Host '  needs validation beyond permissions and consent. For this API that validation' -ForegroundColor Yellow
-    Write-Host '  is the Azure billing link in step 3; Microsoft documents no separate request' -ForegroundColor Yellow
-    Write-Host '  form for it. A token issued before that link exists is still refused, so start' -ForegroundColor Yellow
-    Write-Host '  the utility again once setup finishes.' -ForegroundColor Yellow
+    Write-Host '  needs validation beyond permissions and consent. That validation is the Azure' -ForegroundColor Yellow
+    Write-Host '  billing link in step 3, so finishing this setup is all that is asked of you.' -ForegroundColor Yellow
+    Write-Host '  A token issued before that link exists is still refused, so start the utility' -ForegroundColor Yellow
+    Write-Host '  again once setup finishes.' -ForegroundColor Yellow
 
     $existing = Get-ConfidentialClientConfig
     $replaceOldClientId = ''
